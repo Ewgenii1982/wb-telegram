@@ -100,13 +100,12 @@ def wb_get_new_orders(url: str):
 
     r = requests.get(url, headers=headers, timeout=25)
 
-    # если ошибка — вернем подробности
     if r.status_code != 200:
         return {
             "__error__": True,
             "status_code": r.status_code,
             "url": url,
-            "response_text": r.text[:2000],  # ограничим
+            "response_text": r.text[:2000],
         }
 
     data = r.json()
@@ -115,7 +114,6 @@ def wb_get_new_orders(url: str):
     if isinstance(data, list):
         return data
     return []
-
 def wb_get_feedbacks():
     headers = {"Authorization": WB_FEEDBACKS_TOKEN}
     url = "https://feedbacks-api.wildberries.ru/api/v1/feedbacks"
