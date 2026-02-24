@@ -22,6 +22,8 @@ WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()         # statistics-ap
 WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip() # feedbacks-api (reviews)
 WB_WEBHOOK_SECRET = os.getenv("WB_WEBHOOK_SECRET", "").strip()
 
+SHOP_NAME = os.getenv("SHOP_NAME", "Ваш магазин").strip()
+
 POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "20"))
 POLL_FEEDBACKS_SECONDS = int(os.getenv("POLL_FEEDBACKS_SECONDS", "60"))
 POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "1800"))
@@ -35,13 +37,24 @@ WB_STATISTICS_BASE = "https://statistics-api.wildberries.ru"
 WB_FEEDBACKS_BASE = "https://feedbacks-api.wildberries.ru"
 
 # SQLite for dedupe + cursors
-DB_PATH = "/tmp/wb_telegram.sqlite"
+# ВАЖНО: /tmp на Render очищается при рестарте => будут дубли.
+# Используй постоянный диск /var/data
+DB_PATH = os.getenv("DB_PATH", "/var/data/wb_telegram.sqlite").strip()
 
 
 # -------------------------
 # Helpers: DB
 # -------------------------
+def _ensure_db_dir():
+    try:
+        d = os.path.dirname(DB_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+
 def db() -> sqlite3.Connection:
+    _ensure_db_dir()
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("""
@@ -121,7 +134,6 @@ def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 2
     headers = {"Authorization": token}
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
     if r.status_code >= 400:
-        # Return structured error to show in /poll-once
         return {
             "__error__": True,
             "status_code": r.status_code,
@@ -135,13 +147,38 @@ def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 2
 
 
 # -------------------------
+# Marketplace formatting helpers
+# -------------------------
+def _safe_str(x) -> str:
+    return "" if x is None else str(x).strip()
+
+def _rub(x) -> str:
+    try:
+        v = float(x)
+        if abs(v - int(v)) < 1e-9:
+            return f"{int(v)} ₽"
+        return f"{v:.2f} ₽"
+    except Exception:
+        return "-"
+
+def _format_dt_ru(iso: str) -> str:
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso
+
+def _stars(rating: int) -> str:
+    rating = max(0, min(5, rating))
+    return "★" * rating + "☆" * (5 - rating)
+
+
+# -------------------------
 # FBS/DBS/DBW: Marketplace (near real-time)
 # -------------------------
 def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Tries multiple 'new orders' endpoints.
-    We dedupe by a stable id (orderId / id / etc) + endpoint name.
-    """
     if not WB_MP_TOKEN:
         return []
 
@@ -156,10 +193,8 @@ def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
     for kind, url in endpoints:
         data = wb_get(url, WB_MP_TOKEN)
         if isinstance(data, dict) and data.get("__error__"):
-            # If endpoint not enabled for account it can be 404/403 — ignore quietly
             continue
 
-        # WB may return {"orders":[...]} or list [...]
         orders = []
         if isinstance(data, dict) and "orders" in data and isinstance(data["orders"], list):
             orders = data["orders"]
@@ -171,12 +206,10 @@ def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
         for o in orders:
             if not isinstance(o, dict):
                 continue
-            # pick any id-like field
             oid = (
                 str(o.get("id") or o.get("orderId") or o.get("rid") or o.get("srid") or "")
             ).strip()
             if not oid:
-                # fallback: hash the json (last resort)
                 oid = str(abs(hash(json.dumps(o, ensure_ascii=False, sort_keys=True))))
             found.append((kind, {"_id": oid, **o}))
 
@@ -184,16 +217,16 @@ def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
-    oid = o.get("_id", "")
-    article = o.get("article") or o.get("supplierArticle") or o.get("vendorCode") or ""
-    nm_id = o.get("nmId") or o.get("chrtId") or ""
-    created = o.get("createdAt") or o.get("createdDate") or o.get("dateCreated") or ""
-    warehouse = o.get("warehouseName") or o.get("warehouse") or ""
+    oid = _safe_str(o.get("_id", ""))
+    article = _safe_str(o.get("article") or o.get("supplierArticle") or o.get("vendorCode") or "")
+    nm_id = _safe_str(o.get("nmId") or o.get("chrtId") or "")
+    created = _safe_str(o.get("createdAt") or o.get("createdDate") or o.get("dateCreated") or "")
+    warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or "")
 
     return (
-        f"🆕 Новый заказ ({kind})\n"
+        f"🆕 Новый заказ ({kind}) · {SHOP_NAME}\n"
         f"ID: {oid}\n"
-        f"Артикул: {article}\n"
+        f"Товар: {article}\n"
         f"nmId/chrtId: {nm_id}\n"
         f"Склад: {warehouse}\n"
         f"Дата: {created}\n"
@@ -201,24 +234,17 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
 
 async def poll_marketplace_loop():
-    # no spam "started" messages anymore
     while True:
         try:
             orders = mp_fetch_new_orders()
-            sent = 0
             for kind, o in orders:
                 key = f"mp:{kind}:{o.get('_id','')}"
                 if was_sent(key):
                     continue
-                text = format_mp_order(kind, o)
-                res = tg_send(text)
+                res = tg_send(format_mp_order(kind, o))
                 if res.get("ok"):
                     mark_sent(key)
-                    sent += 1
-
-            # silent if nothing new
         except Exception as e:
-            # send only if really needed (rare), but still dedupe errors
             ek = f"err:mp:{type(e).__name__}:{str(e)[:80]}"
             if not was_sent(ek):
                 tg_send(f"⚠️ Ошибка marketplace polling: {e}")
@@ -234,7 +260,6 @@ def msk_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=3)))
 
 def iso_msk(dt: datetime) -> str:
-    # RFC3339 with +03:00
     return dt.isoformat()
 
 def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
@@ -250,10 +275,8 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
         return [{"__error__": True, **data}]
 
     if not isinstance(data, list) or len(data) == 0:
-        # ✅ нет новых данных — это нормально
         return []
 
-    # ✅ обновляем курсор только если есть хотя бы 1 строка
     last = data[-1]
     if isinstance(last, dict) and last.get("lastChangeDate"):
         set_cursor(cursor_name, last["lastChangeDate"])
@@ -261,22 +284,20 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
     return data
 
 def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
-    """
-    statistics-api sales/returns updated ~ every 30 minutes. :contentReference[oaicite:4]{index=4}
-    """
     if not WB_STATS_TOKEN:
         return []
 
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
     default_dt = msk_now() - timedelta(hours=2)
     cursor = get_cursor(cursor_name, iso_msk(default_dt))
+
     data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": cursor})
     if isinstance(data, dict) and data.get("__error__"):
         return [{"__error__": True, **data}]
 
-    if not isinstance(data, list):
+    if not isinstance(data, list) or len(data) == 0:
         return []
-    len(data) == 0
+
     last = data[-1]
     if isinstance(last, dict) and last.get("lastChangeDate"):
         set_cursor(cursor_name, last["lastChangeDate"])
@@ -284,48 +305,77 @@ def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
     return data
 
 def format_stats_order(o: Dict[str, Any]) -> str:
-    # 1 row = 1 item in order (as docs mention). :contentReference[oaicite:5]{index=5}
-    srid = o.get("srid", "")
-    nm_id = o.get("nmId", "")
-    article = o.get("supplierArticle", "")
-    wh = o.get("warehouseName", "")
-    price = o.get("finishedPrice") or o.get("priceWithDisc") or o.get("totalPrice") or 0
-    is_cancel = o.get("isCancel", False)
+    """
+    Красивый формат как ты просил:
+    🏬 Заказ товара со склада (указать склад) · Название магазина
+    📦 Склад отгрузки: Адрес склада
+    • Наименование товара (артикул)
+      — 1 шт • цена -  ₽
+    Итого позиций: 1
+    Сумма: -
+    """
+    warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB")
+    address = warehouse
 
-    return (
-        f"📦 Заказ/движение (FBW/Statistics)\n"
-        f"srid: {srid}\n"
-        f"Артикул: {article}\n"
-        f"nmId: {nm_id}\n"
-        f"Склад: {wh}\n"
-        f"Цена: {price}\n"
-        f"Отмена: {'да' if is_cancel else 'нет'}"
-    ).strip()
+    # товар/артикул
+    product_name = _safe_str(o.get("subject") or o.get("nmName") or o.get("productName") or o.get("supplierArticle") or "Товар")
+    article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or o.get("nmId") or "")
+
+    qty = o.get("quantity") or o.get("qty") or 1
+    try:
+        qty = int(qty)
+    except Exception:
+        qty = 1
+
+    price = (
+        o.get("finishedPrice")
+        or o.get("priceWithDisc")
+        or o.get("totalPrice")
+        or o.get("forPay")
+        or o.get("price")
+        or 0
+    )
+
+    is_cancel = o.get("isCancel", False)
+    cancel_txt = ""
+    try:
+        if str(is_cancel).lower() in ("1", "true", "yes"):
+            cancel_txt = " ❌ ОТМЕНА"
+    except Exception:
+        pass
+
+    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
+    body = (
+        f"📦 Склад отгрузки: {address}\n"
+        f"• {product_name} ({article})\n"
+        f"  — {qty} шт • цена - {_rub(price)}\n"
+        f"Итого позиций: 1\n"
+        f"Сумма: {_rub(price)}"
+    )
+
+    return f"{header}\n{body}".strip()
 
 async def poll_fbw_loop():
     while True:
         try:
             rows = stats_fetch_orders_since("stats_orders_cursor")
-            # error row
             if rows and isinstance(rows[0], dict) and rows[0].get("__error__"):
                 ek = f"err:stats_orders:{rows[0].get('status_code')}:{rows[0].get('url','')}"
                 if not was_sent(ek):
                     tg_send(f"⚠️ statistics orders error: {rows[0].get('status_code')} {rows[0].get('response_text','')[:300]}")
                     mark_sent(ek)
             else:
-                sent = 0
                 for o in rows:
                     if not isinstance(o, dict):
                         continue
-                    key = f"stats:order:{o.get('srid','')}:{o.get('lastChangeDate','')}"
                     if not o.get("srid"):
                         continue
+                    key = f"stats:order:{o.get('srid','')}:{o.get('lastChangeDate','')}"
                     if was_sent(key):
                         continue
                     res = tg_send(format_stats_order(o))
                     if res.get("ok"):
                         mark_sent(key)
-                        sent += 1
         except Exception as e:
             ek = f"err:stats:{type(e).__name__}:{str(e)[:80]}"
             if not was_sent(ek):
@@ -339,13 +389,6 @@ async def poll_fbw_loop():
 # Feedbacks (reviews)
 # -------------------------
 def feedbacks_fetch_latest() -> List[Dict[str, Any]]:
-    """
-    GET /api/v1/feedbacks requires: isAnswered, take, skip. :contentReference[oaicite:6]{index=6}
-    We'll load latest (answered + unanswered) by pages:
-      - first take=100, skip=0, isAnswered=true
-      - plus unanswered isAnswered=false
-    And dedupe by feedback id.
-    """
     if not WB_FEEDBACKS_TOKEN:
         return []
 
@@ -367,7 +410,6 @@ def feedbacks_fetch_latest() -> List[Dict[str, Any]]:
             out.append({"__error__": True, **data, "__stage__": f"feedbacks isAnswered={is_answered}"})
             continue
 
-        # expected structure: {"data":{"feedbacks":[...]...}, "error":false...} (per samples) :contentReference[oaicite:7]{index=7}
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
             fb = data["data"].get("feedbacks", [])
             if isinstance(fb, list):
@@ -377,43 +419,18 @@ def feedbacks_fetch_latest() -> List[Dict[str, Any]]:
 
     return out
 
-def _stars(rating: int) -> str:
-    rating = max(0, min(5, rating))
-    return "★" * rating + "☆" * (5 - rating)
-
-def _format_dt_ru(iso: str) -> str:
-    """
-    '2025-05-31T10:45:43Z' -> '31.05.2025 10:45'
-    """
-    if not iso:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return iso
-
 def format_feedback(f: Dict[str, Any]) -> str:
-    fid = (f.get("id") or "").strip()
-
-    # рейтинг
     rating = f.get("productValuation")
     try:
         rating_int = int(rating) if rating is not None else 0
     except Exception:
         rating_int = 0
 
-    # хорош/плох
     mood = "Хороший отзыв" if rating_int >= 4 else "Плохой отзыв"
 
-    # магазин/товар
-    shop_name = (f.get("supplierName") or f.get("shopName") or f.get("companyName") or "").strip()
-    if not shop_name:
-        shop_name = "Ваш магазин"
-
+    shop_name = (f.get("supplierName") or f.get("shopName") or f.get("companyName") or SHOP_NAME).strip()
     product_name = (f.get("productName") or f.get("nmName") or f.get("subjectName") or "Без названия").strip()
 
-    # артикул (попробуем разные поля)
     article = (
         f.get("supplierArticle")
         or f.get("vendorCode")
@@ -423,10 +440,8 @@ def format_feedback(f: Dict[str, Any]) -> str:
     )
     article = str(article).strip()
 
-    # текст отзыва — если пусто, пишем что текста нет
     text = (f.get("text") or "").strip()
     if not text:
-        # по твоему требованию: "без текста, только оценка"
         text_line = "Отзыв: (без текста, только оценка)"
     else:
         text_line = f"Отзыв: {text}"
@@ -435,7 +450,6 @@ def format_feedback(f: Dict[str, Any]) -> str:
 
     stars = _stars(rating_int)
 
-    # Итоговый формат
     return (
         f"💬 Новый отзыв о товаре · ({shop_name})\n"
         f"Товар: {product_name} ({article})\n"
@@ -449,7 +463,6 @@ async def poll_feedbacks_loop():
         try:
             items = feedbacks_fetch_latest()
 
-            # handle errors (once)
             for it in items:
                 if isinstance(it, dict) and it.get("__error__"):
                     ek = f"err:feedbacks:{it.get('status_code')}:{it.get('__stage__','')}"
@@ -458,7 +471,6 @@ async def poll_feedbacks_loop():
                         mark_sent(ek)
                     continue
 
-            sent = 0
             for f in items:
                 if not isinstance(f, dict) or f.get("__error__"):
                     continue
@@ -471,7 +483,6 @@ async def poll_feedbacks_loop():
                 res = tg_send(format_feedback(f))
                 if res.get("ok"):
                     mark_sent(key)
-                    sent += 1
 
         except Exception as e:
             ek = f"err:feedbacks:{type(e).__name__}:{str(e)[:80]}"
@@ -486,14 +497,10 @@ async def poll_feedbacks_loop():
 # Daily summary (sales + returns)
 # -------------------------
 def daily_summary_text(today: datetime) -> str:
-    """
-    Builds daily summary from statistics sales.
-    We'll fetch since start of day (MSK), flag=1 by docs (date only matters). :contentReference[oaicite:9]{index=9}
-    """
     if not WB_STATS_TOKEN:
         return "⚠️ Суточная сводка: нет WB_STATS_TOKEN"
 
-    day_str = today.strftime("%Y-%m-%d")  # MSK date
+    day_str = today.strftime("%Y-%m-%d")
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
     data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
     if isinstance(data, dict) and data.get("__error__"):
@@ -503,7 +510,6 @@ def daily_summary_text(today: datetime) -> str:
         return "⚠️ Суточная сводка: нет данных"
 
     sold_sum = 0.0
-    buyout_sum = 0.0
     returns_sum = 0.0
     sold_cnt = 0
     returns_cnt = 0
@@ -511,32 +517,27 @@ def daily_summary_text(today: datetime) -> str:
     for row in data:
         if not isinstance(row, dict):
             continue
-        # heuristics: sale vs return often is indicated by "saleID" and "return" fields,
-        # but to stay robust we use "quantity" sign if exists
+
         price = row.get("forPay") or row.get("priceWithDisc") or row.get("finishedPrice") or 0
         try:
             price = float(price)
         except Exception:
             price = 0.0
 
-        # Some WB rows have "saleID" and "isCancel" etc; simplest: if "saleID" exists -> sale
-        # If you want stricter later, we can refine.
+        # очень простая логика: если saleID есть — считаем продажей
         if row.get("saleID") is not None and price >= 0:
             sold_cnt += 1
             sold_sum += price
-            buyout_sum += price
         else:
-            # treat as return
             returns_cnt += 1
             returns_sum += abs(price)
 
-    # reviews count for day: we won't call feedbacks here to avoid rate issues; just says "смотри ленту"
     return (
-        f"📊 Суточная сводка за {day_str} (МСК)\n"
-        f"Продажи (строк): {sold_cnt}\n"
-        f"Сумма продаж/выкупа (примерно): {buyout_sum:.2f}\n"
-        f"Возвраты/отказы (строк): {returns_cnt}\n"
-        f"Сумма возвратов (примерно): {returns_sum:.2f}\n"
+        f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}\n"
+        f"Продано позиций: {sold_cnt}\n"
+        f"Сумма продаж/выкупа: {sold_sum:.2f}\n"
+        f"Отказы/возвраты позиций: {returns_cnt}\n"
+        f"Сумма отказов/возвратов: {returns_sum:.2f}\n"
         f"Отзывы: см. уведомления (если были — ты их получил)"
     ).strip()
 
@@ -548,10 +549,8 @@ async def daily_summary_loop():
             if target <= now:
                 target += timedelta(days=1)
 
-            # sleep until target
             await asyncio.sleep((target - now).total_seconds())
 
-            # avoid duplicate per day
             day_key = f"daily:{target.strftime('%Y-%m-%d')}"
             if not was_sent(day_key):
                 tg_send(daily_summary_text(target))
@@ -565,7 +564,7 @@ async def daily_summary_loop():
 
 
 # -------------------------
-# Optional: WB webhook receiver (if later you подключишь)
+# Optional: WB webhook receiver
 # -------------------------
 @app.post("/wb-webhook/{secret}")
 async def wb_webhook(secret: str, request: Request):
@@ -573,7 +572,6 @@ async def wb_webhook(secret: str, request: Request):
         raise HTTPException(status_code=403, detail="forbidden")
 
     payload = await request.json()
-    # Dedupe by payload hash
     key = f"webhook:{abs(hash(json.dumps(payload, ensure_ascii=False, sort_keys=True)))}"
     if was_sent(key):
         return {"ok": True, "dedup": True}
@@ -590,18 +588,18 @@ async def wb_webhook(secret: str, request: Request):
 def root():
     return {"status": "ok"}
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 @app.get("/test-telegram")
 def test_telegram():
     return {"telegram_result": tg_send("✅ Тест: сообщение из облачного сервера Render")}
 
 @app.get("/poll-once")
 def poll_once():
-    """
-    Manually run one polling step to debug quickly.
-    """
     result = {}
 
-    # marketplace
     if WB_MP_TOKEN:
         try:
             orders = mp_fetch_new_orders()
@@ -611,7 +609,6 @@ def poll_once():
     else:
         result["marketplace"] = "no WB_MP_TOKEN"
 
-    # feedbacks
     if WB_FEEDBACKS_TOKEN:
         try:
             f = feedbacks_fetch_latest()
@@ -623,7 +620,6 @@ def poll_once():
     else:
         result["feedbacks"] = "no WB_FEEDBACKS_TOKEN"
 
-    # statistics
     if WB_STATS_TOKEN:
         try:
             rows = stats_fetch_orders_since("stats_orders_cursor")
@@ -644,19 +640,15 @@ def poll_once():
 # -------------------------
 @app.on_event("startup")
 async def startup():
-    # init db
     _ = db()
-    # start tasks
+
     asyncio.create_task(poll_marketplace_loop())
     asyncio.create_task(poll_feedbacks_loop())
     asyncio.create_task(poll_fbw_loop())
     asyncio.create_task(daily_summary_loop())
 
-    # one-time hello (ONLY ONCE)
+    # one-time hello (ONLY ONCE, если база постоянная)
     hello_key = "hello:started"
     if not was_sent(hello_key):
         tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой ~30 мин) и отзывы.")
         mark_sent(hello_key)
-@app.get("/health")
-def health():
-    return {"ok": True}
