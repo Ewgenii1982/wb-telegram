@@ -96,9 +96,19 @@ def format_feedback(fb: Dict[str, Any]) -> str:
 
 # ====== WB API ======
 def wb_get_new_orders(url: str):
-    headers = {"Authorization": WB_STATS_TOKEN}
+    headers = {"Authorization": (WB_STATS_TOKEN or "").strip()}
+
     r = requests.get(url, headers=headers, timeout=25)
-    r.raise_for_status()
+
+    # если ошибка — вернем подробности
+    if r.status_code != 200:
+        return {
+            "__error__": True,
+            "status_code": r.status_code,
+            "url": url,
+            "response_text": r.text[:2000],  # ограничим
+        }
+
     data = r.json()
     if isinstance(data, dict) and "orders" in data:
         return data.get("orders") or []
