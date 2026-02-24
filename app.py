@@ -184,20 +184,28 @@ def poll_orders_once() -> List[Dict[str, Any]]:
 def format_feedback_message(fb: Dict[str, Any]) -> str:
     fb_id = fb.get("id") or "?"
     nm_id = fb.get("nmId") or ""
-    rating = fb.get("productValuation") or fb.get("valuation") or fb.get("rate") or ""
+    rating = fb.get("productValuation") or fb.get("valuation") or fb.get("rate") or 0
     text = fb.get("text") or fb.get("feedbackText") or ""
     created = fb.get("createdDate") or fb.get("createdAt") or ""
     user = fb.get("userName") or fb.get("buyerName") or ""
 
-    # ограничим длину, чтобы не улетать простынёй
+    try:
+        rating_num = int(rating)
+    except Exception:
+        rating_num = 0
+
+    if rating_num >= 4:
+        label = "🟢 Хороший отзыв"
+    else:
+        label = "🔴 Плохой отзыв"
+
     if isinstance(text, str) and len(text) > 800:
         text = text[:800] + "…"
 
     return (
-        f"⭐️ Новый отзыв\n"
-        f"ID: {fb_id}\n"
+        f"{label}\n"
+        f"⭐ Оценка: {rating_num}\n"
         f"Артикул: {nm_id}\n"
-        f"Оценка: {rating}\n"
         f"Покупатель: {user}\n"
         f"Дата: {created}\n\n"
         f"{text}"
