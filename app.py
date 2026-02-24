@@ -377,29 +377,72 @@ def feedbacks_fetch_latest() -> List[Dict[str, Any]]:
 
     return out
 
+def _stars(rating: int) -> str:
+    rating = max(0, min(5, rating))
+    return "★" * rating + "☆" * (5 - rating)
+
+def _format_dt_ru(iso: str) -> str:
+    """
+    '2025-05-31T10:45:43Z' -> '31.05.2025 10:45'
+    """
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso
+
 def format_feedback(f: Dict[str, Any]) -> str:
-    fid = f.get("id", "")
-    rating = f.get("productValuation", None)  # field shown in docs sample :contentReference[oaicite:8]{index=8}
+    fid = (f.get("id") or "").strip()
+
+    # рейтинг
+    rating = f.get("productValuation")
+    try:
+        rating_int = int(rating) if rating is not None else 0
+    except Exception:
+        rating_int = 0
+
+    # хорош/плох
+    mood = "Хороший отзыв" if rating_int >= 4 else "Плохой отзыв"
+
+    # магазин/товар
+    shop_name = (f.get("supplierName") or f.get("shopName") or f.get("companyName") or "").strip()
+    if not shop_name:
+        shop_name = "Ваш магазин"
+
+    product_name = (f.get("productName") or f.get("nmName") or f.get("subjectName") or "Без названия").strip()
+
+    # артикул (попробуем разные поля)
+    article = (
+        f.get("supplierArticle")
+        or f.get("vendorCode")
+        or f.get("article")
+        or f.get("nmId")
+        or ""
+    )
+    article = str(article).strip()
+
+    # текст отзыва — если пусто, пишем что текста нет
     text = (f.get("text") or "").strip()
-    pros = (f.get("pros") or "").strip()
-    cons = (f.get("cons") or "").strip()
-    created = f.get("createdDate") or ""
+    if not text:
+        # по твоему требованию: "без текста, только оценка"
+        text_line = "Отзыв: (без текста, только оценка)"
+    else:
+        text_line = f"Отзыв: {text}"
 
-    label = "📝 Отзыв"
-    if isinstance(rating, int):
-        if rating >= 4:
-            label = "✅ Хороший отзыв"
-        else:
-            label = "⚠️ Плохой отзыв"
+    created = _format_dt_ru(f.get("createdDate") or "")
 
-    msg = f"{label}\n⭐ {rating}\nID: {fid}\nДата: {created}"
-    if text:
-        msg += f"\n\nТекст: {text}"
-    if pros:
-        msg += f"\n\nПлюсы: {pros}"
-    if cons:
-        msg += f"\n\nМинусы: {cons}"
-    return msg.strip()
+    stars = _stars(rating_int)
+
+    # Итоговый формат
+    return (
+        f"💬 Новый отзыв о товаре · ({shop_name})\n"
+        f"Товар: {product_name} ({article})\n"
+        f"Оценка: {stars} {rating_int} звезд ({mood})\n"
+        f"{text_line}\n"
+        f"Дата: {created}"
+    ).strip()
 
 async def poll_feedbacks_loop():
     while True:
@@ -614,3 +657,6 @@ async def startup():
     if not was_sent(hello_key):
         tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой ~30 мин) и отзывы.")
         mark_sent(hello_key)
+@app.get("/health")
+def health():
+    return {"ok": True}
