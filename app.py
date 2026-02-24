@@ -238,25 +238,22 @@ def iso_msk(dt: datetime) -> str:
     return dt.isoformat()
 
 def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
-    """
-    statistics-api orders updated ~ every 30 minutes.
-    docs: /api/v1/supplier/orders dateFrom required (MSK timezone). :contentReference[oaicite:3]{index=3}
-    """
     if not WB_STATS_TOKEN:
         return []
 
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    # start cursor default: last 2 hours in MSK
     default_dt = msk_now() - timedelta(hours=2)
     cursor = get_cursor(cursor_name, iso_msk(default_dt))
+
     data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": cursor})
     if isinstance(data, dict) and data.get("__error__"):
         return [{"__error__": True, **data}]
 
-    if not isinstance(data, list):
+    if not isinstance(data, list) or len(data) == 0:
+        # ✅ нет новых данных — это нормально
         return []
 
-    # update cursor by lastChangeDate of last row (as docs recommend)
+    # ✅ обновляем курсор только если есть хотя бы 1 строка
     last = data[-1]
     if isinstance(last, dict) and last.get("lastChangeDate"):
         set_cursor(cursor_name, last["lastChangeDate"])
@@ -279,7 +276,7 @@ def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
 
     if not isinstance(data, list):
         return []
-
+    len(data) == 0
     last = data[-1]
     if isinstance(last, dict) and last.get("lastChangeDate"):
         set_cursor(cursor_name, last["lastChangeDate"])
