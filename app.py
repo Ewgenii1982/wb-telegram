@@ -246,6 +246,8 @@ if isinstance(orders, dict) and orders.get("__error__"):
 
     try:
         feedbacks = wb_get_feedbacks()
+if isinstance(feedbacks, dict) and feedbacks.get("__error__"):
+    return {"feedbacks": "error", "wb": feedbacks}
         for fb in feedbacks:
             fid = fb.get("id")
             if not fid:
