@@ -115,11 +115,28 @@ def wb_get_new_orders(url: str):
         return data
     return []
 def wb_get_feedbacks():
-    headers = {"Authorization": WB_FEEDBACKS_TOKEN}
+    headers = {"Authorization": (WB_FEEDBACKS_TOKEN or "").strip()}
     url = "https://feedbacks-api.wildberries.ru/api/v1/feedbacks"
-    r = requests.get(url, headers=headers, timeout=25)
-    r.raise_for_status()
-    return r.json().get("data", {}).get("feedbacks", [])
+
+    params = {
+        "isAnswered": "false",   # можно true/false, нам не важно, лишь бы работало
+        "take": 100,
+        "skip": 0,
+        "order": "dateDesc"
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=25)
+
+    if r.status_code != 200:
+        return {
+            "__error__": True,
+            "status_code": r.status_code,
+            "url": str(r.url),
+            "response_text": r.text[:2000],
+        }
+
+    data = r.json()
+    return (data.get("data") or {}).get("feedbacks") or []
 
 # ====== POLLING ======
 async def poll_orders_loop():
