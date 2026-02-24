@@ -458,6 +458,37 @@ def format_feedback(f: Dict[str, Any]) -> str:
         f"Дата: {created}"
     ).strip()
 
+def prime_feedbacks_silently(limit: int = 200) -> None:
+    """
+    При старте НЕ шлём историю отзывов в Telegram.
+    Просто помечаем текущие последние отзывы как уже отправленные.
+    """
+    try:
+        items = feedbacks_fetch_latest()
+        # если пришли ошибки — просто выходим (не спамим)
+        for it in items:
+            if isinstance(it, dict) and it.get("__error__"):
+                return
+
+        # помечаем как отправленные (без TG)
+        cnt = 0
+        for f in items:
+            if not isinstance(f, dict):
+                continue
+            fid = (f.get("id") or "").strip()
+            if not fid:
+                continue
+            key = f"feedback:{fid}"
+            if not was_sent(key):
+                mark_sent(key)
+                cnt += 1
+
+        # можно для отладки в логах Render (НЕ в TG)
+        print(f"[prime_feedbacks_silently] marked {cnt} feedbacks as sent")
+
+    except Exception as e:
+        print(f"[prime_feedbacks_silently] error: {e}")
+
 async def poll_feedbacks_loop():
     while True:
         try:
@@ -641,6 +672,9 @@ def poll_once():
 @app.on_event("startup")
 async def startup():
     _ = db()
+
+    # ✅ ВАЖНО: при перезапуске проглатываем историю отзывов (без Telegram)
+    prime_feedbacks_silently()
 
     asyncio.create_task(poll_marketplace_loop())
     asyncio.create_task(poll_feedbacks_loop())
