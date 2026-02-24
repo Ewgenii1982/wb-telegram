@@ -236,7 +236,7 @@ def poll_once():
 # ====== STARTUP ======
 @app.on_event("startup")
 async def startup():
-    tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW) и отзывы.")
+    # Убрали уведомление о старте, чтобы не спамило при перезапусках Render
     asyncio.create_task(poll_orders_loop())
     asyncio.create_task(poll_feedbacks_loop())
     asyncio.create_task(daily_summary_loop())
