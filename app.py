@@ -213,6 +213,9 @@ def poll_once():
 
         for model, url in [("FBS", FBS_URL), ("DBS", DBS_URL), ("DBW", DBW_URL)]:
             orders = wb_get_new_orders(url)
+
+if isinstance(orders, dict) and orders.get("__error__"):
+    return {"orders": "error", "wb": orders}
             for o in orders:
                 oid = o.get("id") or o.get("orderId") or o.get("rid") or o.get("srid")
                 if not oid:
