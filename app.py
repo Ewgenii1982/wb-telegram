@@ -454,10 +454,12 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
     # nmId из заказа (если есть)
     nm_id_raw = it.get("nmId") or it.get("nmID")
+nm_id = None
+if nm_id_raw is not None:
     try:
-    nm_id = int(nm_id_raw) if nm_id_raw is not None else None
+        nm_id = int(nm_id_raw)
     except Exception:
-    nm_id = None
+        nm_id = None
 
 # если вместо названия пришла категория (например, "Расчески") — тянем полное имя из карточки
 if subject and product_name == subject:
