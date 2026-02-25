@@ -538,14 +538,32 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
 
 def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB")
+
+    # nmId из statistics
+    nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
+    nm_id: Optional[int] = None
+    if nm_id_raw is not None:
+        try:
+            nm_id = int(float(nm_id_raw))  # иногда приходит как "537328918.0"
+        except Exception:
+            nm_id = None
+
+    article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or "")
+
+    # то, что пришло из statistics (часто это категория/коротко)
     product_name = _safe_str(o.get("nmName") or o.get("productName") or o.get("subject") or "Товар")
-    article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or o.get("nmId") or "")
+
+    # ✅ Подтягиваем полное наименование из Content API по nmId
+    if nm_id:
+        full_title = content_get_title(nm_id=nm_id, vendor_code=article)
+        if full_title:
+            product_name = full_title
 
     qty = o.get("quantity") or o.get("qty") or 1
     try:
-        qty = int(qty)
+        qty_int = int(qty)
     except Exception:
-        qty = 1
+        qty_int = 1
 
     price = (
         o.get("priceWithDisc")
@@ -558,16 +576,19 @@ def format_stats_order(o: Dict[str, Any]) -> str:
 
     is_cancel = o.get("isCancel", False)
     cancel_txt = " ❌ ОТМЕНА" if str(is_cancel).lower() in ("1", "true", "yes") else ""
+
+    # Остаток для FBW мы не считаем (это склад WB)
     остаток_line = "Остаток: -"
 
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
     body = (
         f"📦 Склад отгрузки: {warehouse}\n"
         f"• {product_name}\n"
-        f"  Артикул: {article}\n"
-        f"  — {qty} шт • цена продажи - {_rub(price)}\n"
+        f"  Артикул: {article or '-'}\n"
+        f"  nmId: {nm_id or '-'}\n"
+        f"  — {qty_int} шт • цена покупателя - {_rub(price)}\n"
         f"{остаток_line}\n"
-        f"Итого позиций: 1\n"
+        f"Итого позиций: {qty_int}\n"
         f"Сумма: {_rub(price)}"
     )
     return f"{header}\n{body}".strip()
