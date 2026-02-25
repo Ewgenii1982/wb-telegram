@@ -203,19 +203,37 @@ def _decode_json_response(r: requests.Response) -> Any:
         return raw.decode("utf-8", errors="replace")
 
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
-    headers = {"Authorization": token, "Accept": "application/json"}
+    headers = {"Authorization": token}
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
+
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
-    return _decode_json_response(r)
+
+    # ✅ парсим JSON из байтов (UTF-8), а не через r.json()
+    try:
+        return json.loads(r.content.decode("utf-8"))
+    except Exception:
+        try:
+            return r.json()
+        except Exception:
+            return r.text
 
 
 def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
-    headers = {"Authorization": token, "Accept": "application/json"}
+    headers = {"Authorization": token}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
-    return _decode_json_response(r)
+
+    # ✅ парсим JSON из байтов (UTF-8), а не через r.json()
+    try:
+        return json.loads(r.content.decode("utf-8"))
+    except Exception:
+        try:
+            return r.json()
+        except Exception:
+            return r.text
 
 
 # -------------------------
