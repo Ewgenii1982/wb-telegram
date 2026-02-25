@@ -1022,6 +1022,14 @@ def clear_cache():
     _FBW_STOCKS_CACHE = (0.0, [])
     return {"ok": True, "cache": "cleared"}
 
+@app.get("/test-questions")
+def test_questions():
+    if not WB_FEEDBACKS_TOKEN:
+        return {"ok": False, "error": "no WB_FEEDBACKS_TOKEN"}
+
+    url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
+    return wb_get(url, WB_FEEDBACKS_TOKEN, params={"take": 20, "skip": 0})
+
 
 # -------------------------
 # Startup
