@@ -507,6 +507,105 @@ async def poll_marketplace_loop():
 
 
 # -------------------------
+# Content API: размеры (sizes) -> chrtId/skus/techSize — кеш
+# -------------------------
+_SIZES_CACHE: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}
+_SIZES_CACHE_TTL = 24 * 3600  # 24 часа
+
+def content_get_sizes(nm_id: int) -> List[Dict[str, Any]]:
+    if not WB_CONTENT_TOKEN or not nm_id:
+        return []
+
+    now = time.time()
+    if nm_id in _SIZES_CACHE:
+        ts, sizes = _SIZES_CACHE[nm_id]
+        if now - ts <= _SIZES_CACHE_TTL:
+            return sizes
+
+    url = f"{WB_CONTENT_BASE}/content/v2/get/cards/list"
+    payload = {
+        "settings": {
+            "sort": {"ascending": False},
+            "filter": {"textSearch": str(nm_id), "withPhoto": -1},
+            "cursor": {"limit": 10}
+        }
+    }
+
+    data = wb_post(url, WB_CONTENT_TOKEN, payload=payload)
+    if not isinstance(data, dict) or data.get("__error__"):
+        return []
+
+    cards = data.get("cards")
+    if not isinstance(cards, list) or not cards:
+        return []
+
+    card = None
+    for c in cards:
+        if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
+            card = c
+            break
+    if not isinstance(card, dict):
+        card = cards[0] if isinstance(cards[0], dict) else None
+    if not isinstance(card, dict):
+        return []
+
+    sizes = card.get("sizes")
+    if not isinstance(sizes, list):
+        return []
+
+    # нормализуем только полезные поля
+    out: List[Dict[str, Any]] = []
+    for s in sizes:
+        if not isinstance(s, dict):
+            continue
+        try:
+            chrt = int(s.get("chrtID") or s.get("chrtId") or 0)
+        except Exception:
+            chrt = 0
+        skus = s.get("skus")
+        if not isinstance(skus, list):
+            skus = []
+        tech = _safe_str(s.get("techSize") or s.get("size") or "")
+        if chrt > 0:
+            out.append({"chrtId": chrt, "skus": [str(x) for x in skus if x], "techSize": tech})
+
+    _SIZES_CACHE[nm_id] = (now, out)
+    return out
+
+def resolve_chrt_id_from_stats_order(o: Dict[str, Any], nm_id: int) -> Optional[int]:
+    """
+    Пытаемся понять, какой вариант купили, чтобы показать остаток именно по нему.
+    Приоритет:
+    1) barcode / skus
+    2) techSize / size
+    3) если размер один — он
+    """
+    sizes = content_get_sizes(nm_id)
+    if not sizes:
+        return None
+
+    # 1) по баркоду (если WB прислал)
+    barcode = _safe_str(o.get("barcode") or o.get("barCode") or o.get("sku") or "")
+    if barcode:
+        for s in sizes:
+            if barcode in (s.get("skus") or []):
+                return int(s["chrtId"])
+
+    # 2) по размеру/техразмеру (иногда туда попадает цвет/размер)
+    tech = _safe_str(o.get("techSize") or o.get("size") or o.get("tech_size") or "")
+    if tech:
+        for s in sizes:
+            if _safe_str(s.get("techSize")) == tech:
+                return int(s["chrtId"])
+
+    # 3) если размер один — берём его
+    if len(sizes) == 1:
+        return int(sizes[0]["chrtId"])
+
+    return None
+
+
+# -------------------------
 # FBW: Statistics (orders)
 # -------------------------
 def msk_now() -> datetime:
@@ -579,6 +678,12 @@ def format_stats_order(o: Dict[str, Any]) -> str:
 
     # Остаток для FBW мы не считаем (это склад WB)
     остаток_line = "Остаток: -"
+if SELLER_WAREHOUSE_ID and WB_MP_TOKEN and nm_id:
+    chrt_id = resolve_chrt_id_from_stats_order(o, nm_id)
+    if chrt_id:
+        stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, [chrt_id])
+        if chrt_id in stocks:
+            остаток_line = f"Остаток: {stocks[chrt_id]} шт"
 
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
     body = (
