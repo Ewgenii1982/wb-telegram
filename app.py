@@ -216,9 +216,16 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     nm_id = o.get("nmId")
     barcode = _safe_str(o.get("barcode"))
 
-    product_name = _safe_str(o.get("subject") or "Товар")
-    qty = int(o.get("quantity") or 1)
+    product_name = _safe_str(
+        o.get("nmName")
+        or o.get("productName")
+        or o.get("subjectName")
+        or o.get("subject")
+        or "Товар"
+    )
 
+    qty = int(o.get("quantity") or 1)
+    
     price = (
         o.get("priceWithDisc")
         or o.get("finishedPrice")
