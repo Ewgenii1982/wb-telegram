@@ -999,6 +999,46 @@ def test_stocks():
         "chrt_ids": chrt_ids,
         "stocks": stocks,
     }
+
+@app.get("/stocks-all/{nm_id}")
+def stocks_all(nm_id: int):
+    if not WB_MP_TOKEN:
+        return {"ok": False, "error": "no WB_MP_TOKEN"}
+    if not WB_CONTENT_TOKEN:
+        return {"ok": False, "error": "no WB_CONTENT_TOKEN"}
+
+    # 1) получаем варианты (chrtId) из карточки
+    sizes = content_get_sizes(int(nm_id))
+    chrt_ids = [int(s["chrtId"]) for s in sizes if isinstance(s, dict) and s.get("chrtId")]
+    chrt_ids = list({x for x in chrt_ids if x > 0})
+
+    if not chrt_ids:
+        return {"ok": False, "error": "no chrtIds for this nmId", "nm_id": nm_id}
+
+    # 2) получаем склады продавца
+    whs = wb_get(f"{WB_MARKETPLACE_BASE}/api/v3/warehouses", WB_MP_TOKEN)
+    if not isinstance(whs, list):
+        return {"ok": False, "error": "cannot get warehouses", "raw": whs}
+
+    out = []
+    for w in whs:
+        if not isinstance(w, dict):
+            continue
+        wid = w.get("id")
+        name = w.get("name")
+        try:
+            wid_int = int(wid)
+        except Exception:
+            continue
+
+        stocks = mp_get_inventory_map(str(wid_int), chrt_ids)
+        out.append({
+            "warehouseId": wid_int,
+            "name": name,
+            "stocks": stocks,  # {chrtId: amount}
+        })
+
+    return {"ok": True, "nm_id": nm_id, "chrt_ids": chrt_ids, "warehouses": out}
     
 # -------------------------
 # Startup: background tasks
