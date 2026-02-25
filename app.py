@@ -356,13 +356,16 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
     lines: List[str] = []
 
     for it in items:
-        product_name = pick_full_product_name(it)
-article = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
+        subject = _safe_str(it.get("subject") or it.get("subjectName"))
+        article = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
 
-# если WB дал только "subject" (категорию), а не полное имя — используем артикул как имя
-subject = _safe_str(it.get("subject") or it.get("subjectName"))
-if product_name and subject and product_name == subject and article:
-    product_name = article  # показываем артикул как название
+        # пробуем вытащить длинное имя
+        product_name = pick_full_product_name(it)
+
+        # если WB дал только "subject" (категорию), а полного имени нет — используем артикул как название
+        if product_name and subject and product_name == subject and article:
+            product_name = article
+
         qty = it.get("quantity") or it.get("qty") or 1
         try:
             qty_int = int(qty)
@@ -396,17 +399,15 @@ if product_name and subject and product_name == subject and article:
         else:
             ost_line = "Остаток: -"
 
-        # чтобы длинные названия читались: перенос строки + артикул отдельно
         lines.append(
             f"• {product_name}\n"
-    f"  Категория: {subject or '-'}\n"
-    f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
-    f"  {ost_line}"
-)
+            f"  Категория: {subject or '-'}\n"
+            f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
+            f"  {ost_line}"
+        )
 
         total_qty += qty_int
-        # если price_f это цена за штуку — умножим, если нет — всё равно будет лучше чем 0
-        total_sum += price_f * max(qty_int, 1) if price_f > 0 else 0.0
+        total_sum += (price_f * qty_int) if price_f > 0 else 0.0
 
     if total_sum <= 0:
         root_price = (
