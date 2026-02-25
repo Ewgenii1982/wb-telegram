@@ -77,7 +77,6 @@ def _stars(rating: int) -> str:
     return "★" * rating + "☆" * (5 - rating)
 
 def tg_word_stars(n: int) -> str:
-    # 1 звезда, 2-4 звезды, 5+ звёзд (и исключения 11–14)
     n = abs(int(n))
     if 11 <= (n % 100) <= 14:
         return "звёзд"
@@ -200,26 +199,68 @@ def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
 
 
 # -------------------------
-# Marketplace Inventory: остатки на складе продавца
-# POST /api/v3/stocks/{warehouseId} (лучше chrtIds, skus deprecated) :contentReference[oaicite:1]{index=1}
+# Marketplace Inventory (остатки) — пачкой + кеш
+# POST /api/v3/stocks/{warehouseId} payload={"chrtIds":[...]}
 # -------------------------
-def mp_get_inventory_amount(warehouse_id: str, chrt_id: int) -> Optional[int]:
-    if not WB_MP_TOKEN or not warehouse_id or not chrt_id:
-        return None
+_STOCKS_CACHE: Dict[str, Tuple[float, Dict[int, int]]] = {}
+_STOCKS_CACHE_TTL = 30  # секунд
+
+def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, int]:
+    """
+    Возвращает мапу {chrtId: amount} для склада продавца.
+    Делаем 1 запрос на пачку chrtIds, плюс кешируем на TTL.
+    """
+    if not WB_MP_TOKEN or not warehouse_id:
+        return {}
+    chrt_ids = [int(x) for x in chrt_ids if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
+    chrt_ids = list({x for x in chrt_ids if x > 0})
+    if not chrt_ids:
+        return {}
+
+    cache_key = f"{warehouse_id}:{','.join(map(str, sorted(chrt_ids)))}"
+    now = time.time()
+    if cache_key in _STOCKS_CACHE:
+        ts, data = _STOCKS_CACHE[cache_key]
+        if now - ts <= _STOCKS_CACHE_TTL:
+            return data
 
     url = f"{WB_MARKETPLACE_BASE}/api/v3/stocks/{warehouse_id}"
-    data = wb_post(url, WB_MP_TOKEN, payload={"chrtIds": [int(chrt_id)]})
+    data = wb_post(url, WB_MP_TOKEN, payload={"chrtIds": chrt_ids})
     if isinstance(data, dict) and data.get("__error__"):
-        return None
+        return {}
 
-    # ожидается {"stocks":[{"chrtId":..., "amount":...}, ...]} :contentReference[oaicite:2]{index=2}
-    if isinstance(data, dict) and isinstance(data.get("stocks"), list) and data["stocks"]:
-        row = data["stocks"][0]
-        try:
-            return int(row.get("amount"))
-        except Exception:
-            return None
-    return None
+    out: Dict[int, int] = {}
+    if isinstance(data, dict) and isinstance(data.get("stocks"), list):
+        for row in data["stocks"]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                cid = int(row.get("chrtId"))
+                amt = int(row.get("amount"))
+                out[cid] = amt
+            except Exception:
+                continue
+
+    _STOCKS_CACHE[cache_key] = (now, out)
+    return out
+
+
+def _extract_items_from_mp_order(o: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Пытаемся получить список позиций заказа.
+    Marketplace иногда отдаёт items, иногда — поля в корне (1 позиция).
+    """
+    items = o.get("items")
+    if isinstance(items, list) and items:
+        norm: List[Dict[str, Any]] = []
+        for it in items:
+            if isinstance(it, dict):
+                norm.append(it)
+        if norm:
+            return norm
+
+    # fallback: 1 позиция из корня
+    return [o]
 
 
 # -------------------------
@@ -241,7 +282,6 @@ def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
         try:
             data = wb_get(url, WB_MP_TOKEN)
         except Exception:
-            # сеть/SSL может упасть на одном эндпоинте — просто пропускаем
             continue
 
         if isinstance(data, dict) and data.get("__error__"):
@@ -268,44 +308,103 @@ def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
 
 def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
     oid = _safe_str(o.get("_id"))
+
     warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "")
-    product_name = _safe_str(
-        o.get("subject") or o.get("nmName") or o.get("productName") or o.get("article") or o.get("supplierArticle") or "Товар"
-    )
-    article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or "")
-    qty = 1
+    header = f"🏬 Новый заказ ({kind}) · {SHOP_NAME}"
 
-    price = (
-        o.get("priceWithDisc")
-        or o.get("finishedPrice")
-        or o.get("forPay")
-        or o.get("totalPrice")
-        or o.get("price")
-        or 0
-    )
+    items = _extract_items_from_mp_order(o)
 
-    chrt_id = o.get("chrtId") or o.get("chrtID")
-    try:
-        chrt_id_int = int(chrt_id) if chrt_id is not None else 0
-    except Exception:
-        chrt_id_int = 0
+    # соберём chrtIds по всем позициям и запросим остатки пачкой
+    chrt_ids: List[int] = []
+    for it in items:
+        cid = it.get("chrtId") or it.get("chrtID")
+        try:
+            cid_int = int(cid) if cid is not None else 0
+        except Exception:
+            cid_int = 0
+        if cid_int > 0:
+            chrt_ids.append(cid_int)
 
-    остаток = None
-    if SELLER_WAREHOUSE_ID and chrt_id_int:
-        остаток = mp_get_inventory_amount(SELLER_WAREHOUSE_ID, chrt_id_int)
+    stocks_map: Dict[int, int] = {}
+    if SELLER_WAREHOUSE_ID and chrt_ids:
+        stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
 
-    остаток_line = f"Остаток: {остаток} шт" if isinstance(остаток, int) else "Остаток: -"
+    # сформируем строки по позициям
+    total_qty = 0
+    total_sum = 0.0
+    lines: List[str] = []
 
-    return (
-        f"🏬 Новый заказ ({kind}) · {SHOP_NAME}\n"
+    for it in items:
+        product_name = _safe_str(
+            it.get("subject") or it.get("nmName") or it.get("productName") or it.get("article") or it.get("supplierArticle") or "Товар"
+        )
+        article = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
+
+        qty = it.get("quantity") or it.get("qty") or 1
+        try:
+            qty_int = int(qty)
+        except Exception:
+            qty_int = 1
+        if qty_int <= 0:
+            qty_int = 1
+
+        price = (
+            it.get("priceWithDisc")
+            or it.get("finishedPrice")
+            or it.get("forPay")
+            or it.get("totalPrice")
+            or it.get("price")
+            or 0
+        )
+        try:
+            price_f = float(price)
+        except Exception:
+            price_f = 0.0
+
+        # остаток по chrtId
+        cid = it.get("chrtId") or it.get("chrtID")
+        try:
+            cid_int = int(cid) if cid is not None else 0
+        except Exception:
+            cid_int = 0
+
+        if isinstance(stocks_map, dict) and cid_int in stocks_map:
+            ost_line = f"Остаток: {stocks_map[cid_int]} шт"
+        else:
+            ost_line = "Остаток: -"
+
+        lines.append(
+            f"• {product_name} ({article or '-'})\n"
+            f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
+            f"  {ost_line}"
+        )
+
+        total_qty += qty_int
+        total_sum += price_f if qty_int == 1 else (price_f * qty_int if price_f > 0 else 0)
+
+    # если total_sum неадекватен (в некоторых ответах цена уже за весь заказ), подстрахуемся
+    if total_sum <= 0:
+        root_price = (
+            o.get("priceWithDisc")
+            or o.get("finishedPrice")
+            or o.get("forPay")
+            or o.get("totalPrice")
+            or o.get("price")
+            or 0
+        )
+        try:
+            total_sum = float(root_price)
+        except Exception:
+            total_sum = 0.0
+
+    body = (
         f"📦 Склад отгрузки: {warehouse or '-'}\n"
-        f"• {product_name} ({article or '-'})\n"
-        f"  — {qty} шт • цена покупателя - {_rub(price)}\n"
-        f"{остаток_line}\n"
-        f"Итого позиций: 1\n"
-        f"Сумма: {_rub(price)}\n"
-        f"ID: {oid}"
-    ).strip()
+        + "\n".join(lines)
+        + f"\nИтого позиций: {total_qty}\n"
+        + f"Сумма: {_rub(total_sum)}\n"
+        + f"ID: {oid}"
+    )
+    return f"{header}\n{body}".strip()
 
 
 async def poll_marketplace_loop():
@@ -320,7 +419,6 @@ async def poll_marketplace_loop():
                 if res.get("ok"):
                     mark_sent(key)
         except Exception as e:
-            # ошибки не спамим каждую секунду — дедупим
             ek = f"err:mp:{type(e).__name__}:{str(e)[:120]}"
             if not was_sent(ek):
                 tg_send(f"⚠️ Ошибка marketplace polling: {e}")
@@ -370,7 +468,6 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     except Exception:
         qty = 1
 
-    # стараемся брать именно "покупательскую" цену со скидкой
     price = (
         o.get("priceWithDisc")
         or o.get("finishedPrice")
@@ -383,8 +480,6 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     is_cancel = o.get("isCancel", False)
     cancel_txt = " ❌ ОТМЕНА" if str(is_cancel).lower() in ("1", "true", "yes") else ""
 
-    # Остаток для FBW (на складе WB) напрямую тут обычно не получить Marketplace Inventory,
-    # поэтому показываем "-" (если захочешь — подключим отдельный источник остатков).
     остаток_line = "Остаток: -"
 
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
@@ -709,6 +804,4 @@ async def startup():
     asyncio.create_task(daily_summary_loop())
 
     if not DISABLE_STARTUP_HELLO:
-        # Не пытаемся сделать "навсегда один раз" на FREE (БД все равно слетает при рестарте),
-        # но можно убрать вообще через DISABLE_STARTUP_HELLO=1
         tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой) и отзывы.")
