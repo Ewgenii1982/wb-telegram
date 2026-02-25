@@ -209,6 +209,49 @@ def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
     except Exception:
         return r.text
 
+_FBW_STOCKS_CACHE = (0.0, [])
+_FBW_STOCKS_TTL = 120  # секунд
+
+def stats_fetch_fbw_stocks() -> List[Dict[str, Any]]:
+    global _FBW_STOCKS_CACHE
+
+    if not WB_STATS_TOKEN:
+        return []
+
+    now = time.time()
+    ts, cached = _FBW_STOCKS_CACHE
+    if cached and (now - ts) <= _FBW_STOCKS_TTL:
+        return cached
+
+    date_from = datetime.utcnow().strftime("%Y-%m-%d")
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/stocks"
+    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": date_from})
+
+    if not isinstance(data, list):
+        return []
+
+    _FBW_STOCKS_CACHE = (now, data)
+    return data
+
+
+def fbw_stock_quantity(warehouse: str, barcode: str) -> Optional[int]:
+    rows = stats_fetch_fbw_stocks()
+
+    warehouse = _safe_str(warehouse)
+    barcode = _safe_str(barcode)
+
+    for r in rows:
+        if (
+            _safe_str(r.get("warehouseName")) == warehouse and
+            _safe_str(r.get("barcode")) == barcode
+        ):
+            try:
+                return int(r.get("quantity", 0))
+            except:
+                return None
+
+    return None
+
 
 # -------------------------
 # Marketplace Inventory (остатки) — пачкой + кеш
@@ -638,31 +681,30 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
     return data
 
 def format_stats_order(o: Dict[str, Any]) -> str:
-    warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB")
+    warehouse = _safe_str(
+        o.get("warehouseName")
+        or o.get("warehouse")
+        or o.get("officeName")
+        or "WB"
+    )
 
-    nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
-    nm_id: Optional[int] = None
-    if nm_id_raw is not None:
-        try:
-            nm_id = int(float(nm_id_raw))  # иногда "537328918.0"
-        except Exception:
-            nm_id = None
-
-    article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or "")
-
-    product_name = _safe_str(o.get("nmName") or o.get("productName") or o.get("subject") or "Товар")
-
-    # ✅ Полное название из Content API
-    if nm_id:
-        full_title = content_get_title(nm_id=nm_id, vendor_code=article)
-        if full_title:
-            product_name = full_title
-
-    qty = o.get("quantity") or o.get("qty") or 1
+    nm_id_raw = o.get("nmId")
     try:
-        qty_int = int(qty)
-    except Exception:
-        qty_int = 1
+        nm_id = int(float(nm_id_raw)) if nm_id_raw else None
+    except:
+        nm_id = None
+
+    barcode = _safe_str(o.get("barcode") or "")
+    article = _safe_str(o.get("supplierArticle") or "")
+
+    product_name = _safe_str(
+        o.get("nmName")
+        or o.get("productName")
+        or o.get("subject")
+        or "Товар"
+    )
+
+    qty = int(o.get("quantity") or 1)
 
     price = (
         o.get("priceWithDisc")
@@ -673,29 +715,25 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or 0
     )
 
-    is_cancel = o.get("isCancel", False)
-    cancel_txt = " ❌ ОТМЕНА" if str(is_cancel).lower() in ("1", "true", "yes") else ""
-
-    # ✅ Остаток (именно вариант) через chrtId -> stocks
+    # 🔥 FBW остаток (как в разделе "Товары")
     остаток_line = "Остаток: -"
-    if SELLER_WAREHOUSE_ID and WB_MP_TOKEN and nm_id:
-        chrt_id = resolve_chrt_id_from_stats_order(o, nm_id)
-        if chrt_id:
-            stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, [chrt_id])
-            if chrt_id in stocks:
-                остаток_line = f"Остаток: {stocks[chrt_id]} шт"
+    stock_q = fbw_stock_quantity(warehouse, barcode)
+    if isinstance(stock_q, int):
+        остаток_line = f"Остаток: {stock_q} шт"
 
-    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
+    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
+
     body = (
         f"📦 Склад отгрузки: {warehouse}\n"
         f"• {product_name}\n"
-        f"  Артикул WB: {nm_id or '-'}\n"
-        f"  — {qty_int} шт • Покупка на сумму - {_rub(price)}\n"
+        f"  Артикул: {nm_id or '-'}\n"
+        f"  — {qty} шт • цена покупателя - {_rub(price)}\n"
         f"{остаток_line}\n"
-        f"Итого позиций: {qty_int}\n"
+        f"Итого позиций: {qty}\n"
         f"Сумма: {_rub(price)}"
     )
-    return f"{header}\n{body}".strip()
+
+    return f"{header}\n{body}"
 
 async def poll_fbw_loop():
     while True:
