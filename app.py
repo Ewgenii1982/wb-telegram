@@ -42,6 +42,9 @@ DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip() == "1"
 # ID вашего склада продавца в WB (Seller warehouseId из marketplace)
 SELLER_WAREHOUSE_ID = os.getenv("SELLER_WAREHOUSE_ID", "").strip()
 
+# Включить DEBUG RAW ORDER в TG (по умолчанию выключено)
+DEBUG_RAW_ORDERS = os.getenv("DEBUG_RAW_ORDERS", "0").strip() == "1"
+
 # WB base URLs
 WB_MARKETPLACE_BASE = "https://marketplace-api.wildberries.ru"
 WB_STATISTICS_BASE = "https://statistics-api.wildberries.ru"
@@ -86,6 +89,34 @@ def tg_word_stars(n: int) -> str:
     if 2 <= last <= 4:
         return "звезды"
     return "звёзд"
+
+def pick_full_product_name(it: Dict[str, Any]) -> str:
+    """
+    Стараемся вывести максимально полное наименование товара.
+    WB часто отдаёт короткое "subject" (категория), а длинное лежит в nmName/productName.
+    """
+    candidates = [
+        it.get("productName"),
+        it.get("nmName"),
+        it.get("goodsName"),
+        it.get("name"),
+        it.get("imtName"),
+        it.get("title"),
+    ]
+    for c in candidates:
+        s = _safe_str(c)
+        if s:
+            return s
+
+    brand = _safe_str(it.get("brand"))
+    subject = _safe_str(it.get("subject") or it.get("subjectName"))
+    tech = _safe_str(it.get("techSize"))
+
+    base = " ".join([x for x in [brand, subject] if x]).strip()
+    if tech and tech not in base:
+        base = (base + f" {tech}").strip()
+
+    return base or "Товар"
 
 
 # -------------------------
@@ -154,7 +185,7 @@ def tg_send(text: str) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TG_CHAT_ID,
-        "text": text,
+        "text": text[:3900],
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=payload, timeout=25)
@@ -206,12 +237,9 @@ _STOCKS_CACHE: Dict[str, Tuple[float, Dict[int, int]]] = {}
 _STOCKS_CACHE_TTL = 30  # секунд
 
 def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, int]:
-    """
-    Возвращает мапу {chrtId: amount} для склада продавца.
-    Делаем 1 запрос на пачку chrtIds, плюс кешируем на TTL.
-    """
     if not WB_MP_TOKEN or not warehouse_id:
         return {}
+
     chrt_ids = [int(x) for x in chrt_ids if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
     chrt_ids = list({x for x in chrt_ids if x > 0})
     if not chrt_ids:
@@ -246,10 +274,6 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
 
 
 def _extract_items_from_mp_order(o: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Пытаемся получить список позиций заказа.
-    Marketplace иногда отдаёт items, иногда — поля в корне (1 позиция).
-    """
     items = o.get("items")
     if isinstance(items, list) and items:
         norm: List[Dict[str, Any]] = []
@@ -258,8 +282,6 @@ def _extract_items_from_mp_order(o: Dict[str, Any]) -> List[Dict[str, Any]]:
                 norm.append(it)
         if norm:
             return norm
-
-    # fallback: 1 позиция из корня
     return [o]
 
 
@@ -314,7 +336,7 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
     items = _extract_items_from_mp_order(o)
 
-    # соберём chrtIds по всем позициям и запросим остатки пачкой
+    # chrtIds -> остатки пачкой
     chrt_ids: List[int] = []
     for it in items:
         cid = it.get("chrtId") or it.get("chrtID")
@@ -329,15 +351,12 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
     if SELLER_WAREHOUSE_ID and chrt_ids:
         stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
 
-    # сформируем строки по позициям
     total_qty = 0
     total_sum = 0.0
     lines: List[str] = []
 
     for it in items:
-        product_name = _safe_str(
-            it.get("subject") or it.get("nmName") or it.get("productName") or it.get("article") or it.get("supplierArticle") or "Товар"
-        )
+        product_name = pick_full_product_name(it)
         article = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
 
         qty = it.get("quantity") or it.get("qty") or 1
@@ -361,7 +380,7 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         except Exception:
             price_f = 0.0
 
-        # остаток по chrtId
+        # остаток
         cid = it.get("chrtId") or it.get("chrtID")
         try:
             cid_int = int(cid) if cid is not None else 0
@@ -373,16 +392,18 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         else:
             ost_line = "Остаток: -"
 
+        # чтобы длинные названия читались: перенос строки + артикул отдельно
         lines.append(
-            f"• {product_name} ({article or '-'})\n"
+            f"• {product_name}\n"
+            f"  Артикул: {article or '-'}\n"
             f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
             f"  {ost_line}"
         )
 
         total_qty += qty_int
-        total_sum += price_f if qty_int == 1 else (price_f * qty_int if price_f > 0 else 0)
+        # если price_f это цена за штуку — умножим, если нет — всё равно будет лучше чем 0
+        total_sum += price_f * max(qty_int, 1) if price_f > 0 else 0.0
 
-    # если total_sum неадекватен (в некоторых ответах цена уже за весь заказ), подстрахуемся
     if total_sum <= 0:
         root_price = (
             o.get("priceWithDisc")
@@ -412,18 +433,26 @@ async def poll_marketplace_loop():
         try:
             orders = mp_fetch_new_orders()
             for kind, o in orders:
-    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
-    if not was_sent(debug_key):
-        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
-        mark_sent(debug_key)
+                # DEBUG RAW ORDER — только если включено переменной окружения
+                if DEBUG_RAW_ORDERS:
+                    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
+                    if not was_sent(debug_key):
+                        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
+                        mark_sent(debug_key)
 
-    key = f"mp:{kind}:{o.get('_id','')}"
-    if was_sent(key):
-        continue
+                key = f"mp:{kind}:{o.get('_id','')}"
+                if was_sent(key):
+                    continue
 
-    res = tg_send(format_mp_order(kind, o))
-    if res.get("ok"):
-        mark_sent(key)
+                res = tg_send(format_mp_order(kind, o))
+                if res.get("ok"):
+                    mark_sent(key)
+
+        except Exception as e:
+            ek = f"err:mp:{type(e).__name__}:{str(e)[:120]}"
+            if not was_sent(ek):
+                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+                mark_sent(ek)
 
         await asyncio.sleep(POLL_FBS_SECONDS)
 
@@ -460,7 +489,7 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
 
 def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB")
-    product_name = _safe_str(o.get("subject") or o.get("nmName") or o.get("productName") or "Товар")
+    product_name = _safe_str(o.get("nmName") or o.get("productName") or o.get("subject") or "Товар")
     article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or o.get("nmId") or "")
 
     qty = o.get("quantity") or o.get("qty") or 1
@@ -486,7 +515,8 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
     body = (
         f"📦 Склад отгрузки: {warehouse}\n"
-        f"• {product_name} ({article})\n"
+        f"• {product_name}\n"
+        f"  Артикул: {article}\n"
         f"  — {qty} шт • цена покупателя - {_rub(price)}\n"
         f"{остаток_line}\n"
         f"Итого позиций: 1\n"
