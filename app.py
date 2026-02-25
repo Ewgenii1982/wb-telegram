@@ -503,6 +503,10 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
         # что пришло из заказа
         product_name = pick_best_name_from_order(it)
+if nm_id:
+    full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
+    if full_title:
+        product_name = full_title
 
         # nmId из заказа (если есть) — БЕЗ “сломанных try”
         nm_id_raw = it.get("nmId") or it.get("nmID")
@@ -577,15 +581,12 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
             total_sum = 0.0
 
     body = (
-    f"📦 Склад отгрузки: {warehouse}\n"
-    f"• {product_name}\n"
-    f"  Артикул: {nm_id or '-'}\n"
-    f"  — {qty_int} шт • Покупка на сумму - {_rub(price)}\n"
-    f"{остаток_line}\n"
-    f"Итого позиций: {qty_int}\n"
-    f"Сумма: {_rub(price)}"
+    f"📦 Склад отгрузки: {warehouse or '-'}\n"
+    + "\n".join(lines)
+    + f"\nИтого позиций: {total_qty}\n"
+    + f"Сумма: {_rub(total_sum)}\n"
+    + f"ID: {oid}"
 )
-    return f"{header}\n{body}".strip()
 
 
 async def poll_marketplace_loop():
@@ -789,14 +790,12 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
 
     body = (
-        f"📦 Склад отгрузки: {warehouse}\n"
-        f"• {product_name}\n"
-        f"  Артикул: {nm_id or '-'}\n"
-        f"  — {qty} шт • Покупка на сумму - {_rub(price)}\n"
-        f"{остаток_line}\n"
-        f"Итого позиций: {qty}\n"
-        f"Сумма: {_rub(price)}"
-    )
+    f"📦 Склад отгрузки: {warehouse or '-'}\n"
+    + "\n".join(lines)
+    + f"\nИтого позиций: {total_qty}\n"
+    + f"Сумма: {_rub(total_sum)}\n"
+    + f"ID: {oid}"
+)
 
     return f"{header}\n{body}"
 
