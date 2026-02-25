@@ -818,7 +818,12 @@ def poll_once():
 
     return result
 
+@app.get("/ping-content")
+def ping_content():
+    if not WB_CONTENT_TOKEN:
+        return {"ok": False, "error": "WB_CONTENT_TOKEN is not set"}
 
+    return wb_get("https://content-api.wildberries.ru/ping", WB_CONTENT_TOKEN)
 # -------------------------
 # Startup: background tasks
 # -------------------------
