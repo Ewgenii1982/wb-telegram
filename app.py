@@ -241,9 +241,10 @@ def stats_fetch_orders_since() -> List[Dict[str, Any]]:
 def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = _safe_str(o.get("warehouseName"))
     nm_id = o.get("nmId")
-    barcode = _safe_str(o.get("barcode"))
 
-    product_name = _safe_str(
+product_name = content_get_title(nm_id)
+if not product_name:
+    product_name = _safe_str(o.get("subject") or "Товар")
         o.get("nmName")
         or o.get("productName")
         or o.get("subjectName")
