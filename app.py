@@ -1146,6 +1146,17 @@ def test_fbw_stocks():
 def clear_cache():
     _TITLE_CACHE.clear()
     return {"ok": True, "title_cache": "cleared"}
+
+def fix_mojibake(s: str) -> str:
+    s = _safe_str(s)
+    if not s:
+        return ""
+
+    try:
+        # универсальное лечение UTF-8 → latin1 → unicode
+        return s.encode("latin1").decode("utf-8")
+    except Exception:
+        return s
     
 # -------------------------
 # Startup: background tasks
