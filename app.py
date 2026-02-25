@@ -180,11 +180,42 @@ def tg_send(text: str) -> Dict[str, Any]:
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=payload, timeout=25)
-    r.encoding = "utf-8"
+    
+def _decode_json_response(r: requests.Response) -> Any:
+    raw = r.content or b""
+
+    # 1) нормальный вариант — utf-8
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        pass
+
+    # 2) если вдруг WB отдал cp1251
+    try:
+        return json.loads(raw.decode("cp1251"))
+    except Exception:
+        pass
+
+    # fallback
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "status": r.status_code, "text": r.text}
+        return raw.decode("utf-8", errors="replace")
+
+def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
+    headers = {"Authorization": token, "Accept": "application/json"}
+    r = requests.get(url, headers=headers, params=params, timeout=timeout)
+    if r.status_code >= 400:
+        return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
+    return _decode_json_response(r)
+
+
+def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
+    headers = {"Authorization": token, "Accept": "application/json"}
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if r.status_code >= 400:
+        return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
+    return _decode_json_response(r)
 
 
 # -------------------------
@@ -254,6 +285,19 @@ def fbw_stock_quantity(warehouse: str, barcode: str) -> Optional[int]:
                 return None
 
     return None
+
+def fix_mojibake(s: str) -> str:
+    s = _safe_str(s)
+    if not s:
+        return ""
+
+    # если видим характерные "Р Р°С..."
+    if "Р" in s or "С" in s:
+        try:
+            return s.encode("cp1251").decode("utf-8")
+        except Exception:
+            return s
+    return s
 
 
 # -------------------------
@@ -348,12 +392,12 @@ def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str
     if nm_id:
         for c in cards:
             if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
-                title = _safe_str(c.get("title"))
+                title = fix_mojibake(_safe_str(c.get("title")))
                 if title:
                     _TITLE_CACHE[key] = (now, title)
                     return title
 
-    title = _safe_str(cards[0].get("title")) if isinstance(cards[0], dict) else ""
+    title = fix_mojibake(_safe_str(cards[0].get("title"))) if isinstance(cards[0], dict) else ""
     if title:
         _TITLE_CACHE[key] = (now, title)
     return title
