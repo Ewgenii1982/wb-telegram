@@ -30,6 +30,7 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/wb_telegram.sqlite").strip()
 
 POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "20"))
 POLL_FEEDBACKS_SECONDS = int(os.getenv("POLL_FEEDBACKS_SECONDS", "60"))
+POLL_QUESTIONS_SECONDS = int(os.getenv("POLL_QUESTIONS_SECONDS", "60"))
 POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "1800"))
 
 DAILY_SUMMARY_HOUR_MSK = int(os.getenv("DAILY_SUMMARY_HOUR_MSK", "23"))
@@ -56,6 +57,38 @@ WB_CONTENT_BASE = "https://content-api.wildberries.ru"
 def _safe_str(x) -> str:
     return "" if x is None else str(x).strip()
 
+def fix_mojibake(s: str) -> str:
+    """
+    Лечит типичные кракозябры WB вида "Р Р°С..." и "Ð..." .
+    Безопасно: если не получилось — вернет исходное.
+    """
+    s = _safe_str(s)
+    if not s:
+        return ""
+
+    # 1) Частый кейс WB: UTF-8 байты прочитали как CP1251 -> "Р°С..."
+    if any(x in s for x in ("Р°", "Рќ", "Рџ", "СЃ", "С‚", "СЏ", "Рё", "Рѕ", "Рµ")):
+        try:
+            fixed = s.encode("cp1251", errors="ignore").decode("utf-8", errors="ignore").strip()
+            if fixed:
+                # поправка редкого глюка, когда первая буква теряется и получается "асческа"
+                if fixed.startswith("ас") and ("Р°С" in s or "СЃС" in s):
+                    fixed = "р" + fixed
+                return fixed
+        except Exception:
+            pass
+
+    # 2) Другой популярный кейс: UTF-8 прочитали как latin1 -> "Ð..."
+    if "Ð" in s or "Ñ" in s:
+        try:
+            fixed = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore").strip()
+            if fixed:
+                return fixed
+        except Exception:
+            pass
+
+    return s
+    
 def _rub(x) -> str:
     try:
         v = float(x)
@@ -88,29 +121,6 @@ def tg_word_stars(n: int) -> str:
     if 2 <= last <= 4:
         return "звезды"
     return "звёзд"
-
-def fix_mojibake(s: str) -> str:
-    """
-    Лечит типичное "Р Р°С..." (когда UTF-8 текст был неверно интерпретирован).
-    Работает безопасно: если не лечится — вернёт как есть.
-    """
-    s = _safe_str(s)
-    if not s:
-        return ""
-
-    # Частый случай: UTF-8 байты прочитали как latin1 -> получили "Р ..."
-    # Пытаемся latin1->utf8
-    if "Р" in s or "С" in s:
-        try:
-            fixed = s.encode("latin1").decode("utf-8")
-            # если стало хуже/пусто — не применяем
-            if fixed and fixed.count("�") <= s.count("�"):
-                return fixed
-        except Exception:
-            pass
-
-    return s
-
 
 # -------------------------
 # Helpers: DB (dedup + cursors)
@@ -207,14 +217,14 @@ def _decode_json_from_response(r: requests.Response) -> Any:
         return (raw.decode("utf-8", errors="replace") or r.text)
 
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
-    headers = {"Authorization": token} if token else {}
+    headers = {"Authorization": token}
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
     return _decode_json_from_response(r)
 
 def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
-    headers = {"Authorization": token} if token else {}
+    headers = {"Authorization": token}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
@@ -715,6 +725,99 @@ def format_stats_order(o: Dict[str, Any]) -> str:
 
     return f"{header}\n{body}".strip()
 
+# -------------------------
+# Questions (Q&A)
+# -------------------------
+def questions_fetch(is_answered: bool) -> List[Dict[str, Any]]:
+    if not WB_FEEDBACKS_TOKEN:
+        return []
+
+    url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
+    data = wb_get(
+        url,
+        WB_FEEDBACKS_TOKEN,
+        params={
+            "isAnswered": "true" if is_answered else "false",
+            "take": 100,
+            "skip": 0
+        },
+    )
+
+    if isinstance(data, dict) and data.get("__error__"):
+        return [{"__error__": True, **data, "__stage__": f"questions isAnswered={is_answered}"}]
+
+    # формат WB: {"data": {...}, "error": false}
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        qs = data["data"].get("questions", [])
+        if isinstance(qs, list):
+            return [q for q in qs if isinstance(q, dict)]
+
+    return []
+
+def format_question(q: Dict[str, Any]) -> str:
+    qid = _safe_str(q.get("id"))
+    text = fix_mojibake(_safe_str(q.get("text") or ""))
+    created = _format_dt_ru(_safe_str(q.get("createdDate") or ""))
+
+    pd = q.get("productDetails") if isinstance(q.get("productDetails"), dict) else {}
+    nm_id_raw = pd.get("nmId")
+    nm_id: Optional[int] = None
+    try:
+        nm_id = int(float(nm_id_raw)) if nm_id_raw is not None else None
+    except Exception:
+        nm_id = None
+
+    product_name = fix_mojibake(_safe_str(pd.get("productName") or "Товар"))
+    supplier_article = fix_mojibake(_safe_str(pd.get("supplierArticle") or ""))
+
+    # улучшаем до полного title, если можем
+    if nm_id:
+        full_title = content_get_title(nm_id=nm_id, vendor_code=supplier_article)
+        if full_title:
+            product_name = full_title
+
+    header = f"❓ Вопрос покупателя · {SHOP_NAME}"
+    body = (
+        f"Товар: {product_name}\n"
+        f"Артикул WB: {nm_id or '-'}\n"
+        f"Вопрос: {text}\n"
+        f"Дата: {created}\n"
+        f"ID: {qid}"
+    )
+    return f"{header}\n{body}".strip()
+
+async def poll_questions_loop():
+    while True:
+        try:
+            # важнее всего — НЕотвеченные
+            items = questions_fetch(is_answered=False)
+
+            # если WB вернул ошибку — уведомим один раз
+            if items and isinstance(items[0], dict) and items[0].get("__error__"):
+                it = items[0]
+                ek = f"err:questions:{it.get('status_code')}:{it.get('__stage__','')}"
+                if not was_sent(ek):
+                    tg_send(f"⚠️ questions error: {it.get('status_code')} {it.get('response_text','')[:300]}")
+                    mark_sent(ek)
+            else:
+                for q in items:
+                    qid = _safe_str(q.get("id"))
+                    if not qid:
+                        continue
+                    key = f"question:{qid}"
+                    if was_sent(key):
+                        continue
+                    res = tg_send(format_question(q))
+                    if res.get("ok"):
+                        mark_sent(key)
+
+        except Exception as e:
+            ek = f"err:questions:{type(e).__name__}:{str(e)[:160]}"
+            if not was_sent(ek):
+                tg_send(f"⚠️ Ошибка questions polling: {e}")
+                mark_sent(ek)
+
+        await asyncio.sleep(POLL_QUESTIONS_SECONDS)
 
 # -------------------------
 # Feedbacks
@@ -1048,6 +1151,7 @@ async def startup():
     asyncio.create_task(poll_feedbacks_loop())
     asyncio.create_task(poll_fbw_loop())
     asyncio.create_task(daily_summary_loop())
+    asyncio.create_task(poll_questions_loop())
 
     if not DISABLE_STARTUP_HELLO:
         tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой) и отзывы.")
