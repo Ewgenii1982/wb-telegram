@@ -22,11 +22,9 @@ WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()         # statistics-ap
 WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip() # feedbacks-api (reviews)
 WB_WEBHOOK_SECRET = os.getenv("WB_WEBHOOK_SECRET", "").strip()
 
-# токен WB Content API (для полного названия товара)
-WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()
+WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()     # content-api (title/sizes)
 
 SHOP_NAME = os.getenv("SHOP_NAME", "Bright Shop").strip()
-
 DB_PATH = os.getenv("DB_PATH", "/tmp/wb_telegram.sqlite").strip()
 
 POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "20"))
@@ -38,13 +36,11 @@ DAILY_SUMMARY_MINUTE_MSK = int(os.getenv("DAILY_SUMMARY_MINUTE_MSK", "55"))
 
 DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip() == "1"
 
-# Остатки на складе продавца (FBS/DBS/DBW):
+# Остатки продавца (FBS/DBS/DBW) — warehouseId из marketplace /api/v3/warehouses (не officeId)
 SELLER_WAREHOUSE_ID = os.getenv("SELLER_WAREHOUSE_ID", "").strip()
 
-# DEBUG RAW JSON заказов (в TG) — включай только временно
 DEBUG_RAW_ORDERS = os.getenv("DEBUG_RAW_ORDERS", "0").strip() == "1"
 
-# WB base URLs
 WB_MARKETPLACE_BASE = "https://marketplace-api.wildberries.ru"
 WB_STATISTICS_BASE = "https://statistics-api.wildberries.ru"
 WB_FEEDBACKS_BASE = "https://feedbacks-api.wildberries.ru"
@@ -91,9 +87,6 @@ def tg_word_stars(n: int) -> str:
     return "звёзд"
 
 def pick_best_name_from_order(it: Dict[str, Any]) -> str:
-    """
-    Лучшее название из самого заказа (если WB его вообще прислал).
-    """
     candidates = [
         it.get("productName"),
         it.get("nmName"),
@@ -180,23 +173,23 @@ def tg_send(text: str) -> Dict[str, Any]:
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=payload, timeout=25)
-    
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "status": r.status_code, "text": r.text}
+
+
+# -------------------------
+# Helpers: WB requests (ЕДИНСТВЕННАЯ версия)
+# -------------------------
 def _decode_json_response(r: requests.Response) -> Any:
     raw = r.content or b""
-
-    # 1) нормальный вариант — utf-8
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        pass
-
-    # 2) если вдруг WB отдал cp1251
-    try:
-        return json.loads(raw.decode("cp1251"))
-    except Exception:
-        pass
-
-    # fallback
+    # WB обычно UTF-8
+    for enc in ("utf-8", "cp1251"):
+        try:
+            return json.loads(raw.decode(enc))
+        except Exception:
+            pass
     try:
         return r.json()
     except Exception:
@@ -205,63 +198,38 @@ def _decode_json_response(r: requests.Response) -> Any:
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
-
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
-
-    # ✅ парсим JSON из байтов (UTF-8), а не через r.json()
-    try:
-        return json.loads(r.content.decode("utf-8"))
-    except Exception:
-        try:
-            return r.json()
-        except Exception:
-            return r.text
-
+    return _decode_json_response(r)
 
 def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
+    return _decode_json_response(r)
 
-    # ✅ парсим JSON из байтов (UTF-8), а не через r.json()
-    try:
-        return json.loads(r.content.decode("utf-8"))
-    except Exception:
+
+# -------------------------
+# “Лечение кракозябр” (ТОЛЬКО если реально похоже на mojibake)
+# -------------------------
+def fix_mojibake(s: str) -> str:
+    s = _safe_str(s)
+    if not s:
+        return ""
+    # Типичный мусор вида "Р Р°С..."
+    if "Р" in s and "С" in s:
         try:
-            return r.json()
+            return s.encode("cp1251").decode("utf-8")
         except Exception:
-            return r.text
+            return s
+    return s
 
 
 # -------------------------
-# Helpers: WB requests
+# FBW Stocks (statistics /supplier/stocks) — кеш
 # -------------------------
-def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
-    headers = {"Authorization": token}
-    r = requests.get(url, headers=headers, params=params, timeout=timeout)
-    r.encoding = "utf-8"  # ✅ ВОТ ЭТО
-    if r.status_code >= 400:
-        return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
-    try:
-        return r.json()
-    except Exception:
-        return r.text
-
-def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
-    headers = {"Authorization": token}
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-    r.encoding = "utf-8"  # ✅ И ВОТ ЭТО
-    if r.status_code >= 400:
-        return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
-    try:
-        return r.json()
-    except Exception:
-        return r.text
-
-_FBW_STOCKS_CACHE = (0.0, [])
+_FBW_STOCKS_CACHE: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
 _FBW_STOCKS_TTL = 120  # секунд
 
 def stats_fetch_fbw_stocks() -> List[Dict[str, Any]]:
@@ -285,41 +253,26 @@ def stats_fetch_fbw_stocks() -> List[Dict[str, Any]]:
     _FBW_STOCKS_CACHE = (now, data)
     return data
 
-
 def fbw_stock_quantity(warehouse: str, barcode: str) -> Optional[int]:
     rows = stats_fetch_fbw_stocks()
-
     warehouse = _safe_str(warehouse)
     barcode = _safe_str(barcode)
+    if not warehouse or not barcode:
+        return None
 
     for r in rows:
-        if (
-            _safe_str(r.get("warehouseName")) == warehouse and
-            _safe_str(r.get("barcode")) == barcode
-        ):
+        if not isinstance(r, dict):
+            continue
+        if _safe_str(r.get("warehouseName")) == warehouse and _safe_str(r.get("barcode")) == barcode:
             try:
                 return int(r.get("quantity", 0))
-            except:
+            except Exception:
                 return None
-
     return None
-
-def fix_mojibake(s: str) -> str:
-    s = _safe_str(s)
-    if not s:
-        return ""
-
-    # если видим характерные "Р Р°С..."
-    if "Р" in s or "С" in s:
-        try:
-            return s.encode("cp1251").decode("utf-8")
-        except Exception:
-            return s
-    return s
 
 
 # -------------------------
-# Marketplace Inventory (остатки) — пачкой + кеш
+# Marketplace Inventory (FBS/DBS/DBW остатки продавца) — кеш
 # -------------------------
 _STOCKS_CACHE: Dict[str, Tuple[float, Dict[int, int]]] = {}
 _STOCKS_CACHE_TTL = 30  # секунд
@@ -328,19 +281,20 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
     if not WB_MP_TOKEN or not warehouse_id:
         return {}
 
-    chrt_ids2: List[int] = []
+    ids: List[int] = []
     for x in chrt_ids:
         try:
             xi = int(x)
             if xi > 0:
-                chrt_ids2.append(xi)
+                ids.append(xi)
         except Exception:
             continue
-    chrt_ids2 = list({x for x in chrt_ids2})
-    if not chrt_ids2:
+
+    ids = list({x for x in ids})
+    if not ids:
         return {}
 
-    cache_key = f"{warehouse_id}:{','.join(map(str, sorted(chrt_ids2)))}"
+    cache_key = f"{warehouse_id}:{','.join(map(str, sorted(ids)))}"
     now = time.time()
     if cache_key in _STOCKS_CACHE:
         ts, data = _STOCKS_CACHE[cache_key]
@@ -348,7 +302,7 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
             return data
 
     url = f"{WB_MARKETPLACE_BASE}/api/v3/stocks/{warehouse_id}"
-    data = wb_post(url, WB_MP_TOKEN, payload={"chrtIds": chrt_ids2})
+    data = wb_post(url, WB_MP_TOKEN, payload={"chrtIds": ids})
     if isinstance(data, dict) and data.get("__error__"):
         return {}
 
@@ -369,7 +323,7 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
 
 
 # -------------------------
-# Content API: полное наименование товара (title) — кеш
+# Content API: title + sizes — кеш
 # -------------------------
 _TITLE_CACHE: Dict[str, Tuple[float, str]] = {}
 _TITLE_CACHE_TTL = 24 * 3600  # 24 часа
@@ -400,13 +354,14 @@ def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str
     }
 
     data = wb_post(url, WB_CONTENT_TOKEN, payload=payload)
-    if isinstance(data, dict) and data.get("__error__"):
+    if not isinstance(data, dict) or data.get("__error__"):
         return ""
 
-    cards = data.get("cards") if isinstance(data, dict) else None
+    cards = data.get("cards")
     if not isinstance(cards, list) or not cards:
         return ""
 
+    # точное совпадение nmID
     if nm_id:
         for c in cards:
             if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
@@ -415,211 +370,15 @@ def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str
                     _TITLE_CACHE[key] = (now, title)
                     return title
 
-    title = fix_mojibake(_safe_str(cards[0].get("title"))) if isinstance(cards[0], dict) else ""
-    if title:
-        _TITLE_CACHE[key] = (now, title)
-    return title
+    # fallback на первую карточку
+    if isinstance(cards[0], dict):
+        title = fix_mojibake(_safe_str(cards[0].get("title")))
+        if title:
+            _TITLE_CACHE[key] = (now, title)
+            return title
 
+    return ""
 
-def _extract_items_from_mp_order(o: Dict[str, Any]) -> List[Dict[str, Any]]:
-    items = o.get("items")
-    if isinstance(items, list) and items:
-        return [it for it in items if isinstance(it, dict)]
-    return [o]
-
-
-# -------------------------
-# Marketplace: New orders
-# -------------------------
-def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
-    if not WB_MP_TOKEN:
-        return []
-
-    endpoints = [
-        ("FBS", f"{WB_MARKETPLACE_BASE}/api/v3/orders/new"),
-        ("DBS", f"{WB_MARKETPLACE_BASE}/api/v3/dbs/orders/new"),
-        ("DBW", f"{WB_MARKETPLACE_BASE}/api/v3/dbw/orders/new"),
-    ]
-
-    found: List[Tuple[str, Dict[str, Any]]] = []
-
-    for kind, url in endpoints:
-        try:
-            data = wb_get(url, WB_MP_TOKEN)
-        except Exception:
-            continue
-
-        if isinstance(data, dict) and data.get("__error__"):
-            continue
-
-        orders: List[Any] = []
-        if isinstance(data, dict) and isinstance(data.get("orders"), list):
-            orders = data["orders"]
-        elif isinstance(data, list):
-            orders = data
-        else:
-            continue
-
-        for o in orders:
-            if not isinstance(o, dict):
-                continue
-            oid = _safe_str(o.get("id") or o.get("orderId") or o.get("rid") or o.get("srid"))
-            if not oid:
-                oid = str(abs(hash(json.dumps(o, ensure_ascii=False, sort_keys=True))))
-            found.append((kind, {"_id": oid, **o}))
-
-    return found
-
-
-def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
-    oid = _safe_str(o.get("_id"))
-    warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "")
-    header = f"🏬 Новый заказ ({kind}) · {SHOP_NAME}"
-
-    items = _extract_items_from_mp_order(o)
-
-    # Остатки — пачкой
-    chrt_ids: List[int] = []
-    for it in items:
-        cid = it.get("chrtId") or it.get("chrtID")
-        try:
-            ci = int(cid) if cid is not None else 0
-        except Exception:
-            ci = 0
-        if ci > 0:
-            chrt_ids.append(ci)
-
-    stocks_map: Dict[int, int] = {}
-    if SELLER_WAREHOUSE_ID and chrt_ids:
-        stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
-
-    total_qty = 0
-    total_sum = 0.0
-    lines: List[str] = []
-
-    for it in items:
-        subject = _safe_str(it.get("subject") or it.get("subjectName"))
-        vendor_code = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
-
-        # что пришло из заказа
-        product_name = pick_best_name_from_order(it)
-if nm_id:
-    full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
-    if full_title:
-        product_name = full_title
-
-        # nmId из заказа (если есть) — БЕЗ “сломанных try”
-        nm_id_raw = it.get("nmId") or it.get("nmID")
-        nm_id: Optional[int] = None
-        if nm_id_raw is not None:
-            try:
-                nm_id = int(nm_id_raw)
-            except Exception:
-                nm_id = None
-
-        # если вместо названия пришла категория — тянем title из карточки
-        if subject and product_name == subject:
-            full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
-            if full_title:
-                product_name = full_title
-
-        qty = it.get("quantity") or it.get("qty") or 1
-        try:
-            qty_int = int(qty)
-        except Exception:
-            qty_int = 1
-        if qty_int <= 0:
-            qty_int = 1
-
-        price = (
-            it.get("priceWithDisc")
-            or it.get("finishedPrice")
-            or it.get("forPay")
-            or it.get("totalPrice")
-            or it.get("price")
-            or 0
-        )
-        try:
-            price_f = float(price)
-        except Exception:
-            price_f = 0.0
-
-        cid = it.get("chrtId") or it.get("chrtID")
-        try:
-            cid_int = int(cid) if cid is not None else 0
-        except Exception:
-            cid_int = 0
-
-        if cid_int in stocks_map:
-            ost_line = f"Остаток: {stocks_map[cid_int]} шт"
-        else:
-            ost_line = "Остаток: -"
-
-        lines.append(
-            f"• {product_name}\n"
-            f"  Артикул: {vendor_code or '-'}\n"
-            f"  — {qty_int} шт • Покупка на сумму - {_rub(price_f)}\n"
-            f"  {ost_line}"
-        )
-
-        total_qty += qty_int
-        if price_f > 0:
-            total_sum += price_f * qty_int
-
-    if total_sum <= 0:
-        root_price = (
-            o.get("priceWithDisc")
-            or o.get("finishedPrice")
-            or o.get("forPay")
-            or o.get("totalPrice")
-            or o.get("price")
-            or 0
-        )
-        try:
-            total_sum = float(root_price)
-        except Exception:
-            total_sum = 0.0
-
-    body = (
-    f"📦 Склад отгрузки: {warehouse or '-'}\n"
-    + "\n".join(lines)
-    + f"\nИтого позиций: {total_qty}\n"
-    + f"Сумма: {_rub(total_sum)}\n"
-    + f"ID: {oid}"
-)
-
-
-async def poll_marketplace_loop():
-    while True:
-        try:
-            orders = mp_fetch_new_orders()
-            for kind, o in orders:
-                if DEBUG_RAW_ORDERS:
-                    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
-                    if not was_sent(debug_key):
-                        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
-                        mark_sent(debug_key)
-
-                key = f"mp:{kind}:{o.get('_id','')}"
-                if was_sent(key):
-                    continue
-
-                res = tg_send(format_mp_order(kind, o))
-                if res.get("ok"):
-                    mark_sent(key)
-
-        except Exception as e:
-            ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
-            if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
-                mark_sent(ek)
-
-        await asyncio.sleep(POLL_FBS_SECONDS)
-
-
-# -------------------------
-# Content API: размеры (sizes) -> chrtId/skus/techSize — кеш
-# -------------------------
 _SIZES_CACHE: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}
 _SIZES_CACHE_TTL = 24 * 3600  # 24 часа
 
@@ -664,7 +423,6 @@ def content_get_sizes(nm_id: int) -> List[Dict[str, Any]]:
     if not isinstance(sizes, list):
         return []
 
-    # нормализуем только полезные поля
     out: List[Dict[str, Any]] = []
     for s in sizes:
         if not isinstance(s, dict):
@@ -683,37 +441,189 @@ def content_get_sizes(nm_id: int) -> List[Dict[str, Any]]:
     _SIZES_CACHE[nm_id] = (now, out)
     return out
 
-def resolve_chrt_id_from_stats_order(o: Dict[str, Any], nm_id: int) -> Optional[int]:
-    """
-    Пытаемся понять, какой вариант купили, чтобы показать остаток именно по нему.
-    Приоритет:
-    1) barcode / skus
-    2) techSize / size
-    3) если размер один — он
-    """
-    sizes = content_get_sizes(nm_id)
-    if not sizes:
-        return None
 
-    # 1) по баркоду (если WB прислал)
-    barcode = _safe_str(o.get("barcode") or o.get("barCode") or o.get("sku") or "")
-    if barcode:
-        for s in sizes:
-            if barcode in (s.get("skus") or []):
-                return int(s["chrtId"])
+# -------------------------
+# Marketplace: new orders
+# -------------------------
+def _extract_items_from_mp_order(o: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = o.get("items")
+    if isinstance(items, list) and items:
+        return [it for it in items if isinstance(it, dict)]
+    return [o]
 
-    # 2) по размеру/техразмеру (иногда туда попадает цвет/размер)
-    tech = _safe_str(o.get("techSize") or o.get("size") or o.get("tech_size") or "")
-    if tech:
-        for s in sizes:
-            if _safe_str(s.get("techSize")) == tech:
-                return int(s["chrtId"])
+def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
+    if not WB_MP_TOKEN:
+        return []
 
-    # 3) если размер один — берём его
-    if len(sizes) == 1:
-        return int(sizes[0]["chrtId"])
+    endpoints = [
+        ("FBS", f"{WB_MARKETPLACE_BASE}/api/v3/orders/new"),
+        ("DBS", f"{WB_MARKETPLACE_BASE}/api/v3/dbs/orders/new"),
+        ("DBW", f"{WB_MARKETPLACE_BASE}/api/v3/dbw/orders/new"),
+    ]
 
-    return None
+    found: List[Tuple[str, Dict[str, Any]]] = []
+
+    for kind, url in endpoints:
+        data = wb_get(url, WB_MP_TOKEN)
+        if isinstance(data, dict) and data.get("__error__"):
+            continue
+
+        orders: List[Any] = []
+        if isinstance(data, dict) and isinstance(data.get("orders"), list):
+            orders = data["orders"]
+        elif isinstance(data, list):
+            orders = data
+        else:
+            continue
+
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            oid = _safe_str(o.get("id") or o.get("orderId") or o.get("rid") or o.get("srid"))
+            if not oid:
+                oid = str(abs(hash(json.dumps(o, ensure_ascii=False, sort_keys=True))))
+            found.append((kind, {"_id": oid, **o}))
+
+    return found
+
+def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
+    oid = _safe_str(o.get("_id"))
+    warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "")
+    header = f"🏬 Новый заказ ({kind}) · {SHOP_NAME}"
+
+    items = _extract_items_from_mp_order(o)
+
+    # stocks for seller warehouse (FBS/DBS/DBW)
+    chrt_ids: List[int] = []
+    for it in items:
+        cid = it.get("chrtId") or it.get("chrtID")
+        try:
+            ci = int(cid) if cid is not None else 0
+        except Exception:
+            ci = 0
+        if ci > 0:
+            chrt_ids.append(ci)
+
+    stocks_map: Dict[int, int] = {}
+    if SELLER_WAREHOUSE_ID and chrt_ids:
+        stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
+
+    total_qty = 0
+    total_sum = 0.0
+    lines: List[str] = []
+
+    for it in items:
+        vendor_code = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
+        product_name = pick_best_name_from_order(it)
+
+        # nmId
+        nm_id_raw = it.get("nmId") or it.get("nmID")
+        nm_id: Optional[int] = None
+        if nm_id_raw is not None:
+            try:
+                nm_id = int(nm_id_raw)
+            except Exception:
+                nm_id = None
+
+        # всегда пытаемся “красивый title” из Content (если nmId есть)
+        if nm_id:
+            full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
+            if full_title:
+                product_name = full_title
+
+        # qty
+        qty = it.get("quantity") or it.get("qty") or 1
+        try:
+            qty_int = int(qty)
+        except Exception:
+            qty_int = 1
+        if qty_int <= 0:
+            qty_int = 1
+
+        # price
+        price = (
+            it.get("priceWithDisc")
+            or it.get("finishedPrice")
+            or it.get("forPay")
+            or it.get("totalPrice")
+            or it.get("price")
+            or 0
+        )
+        try:
+            price_f = float(price)
+        except Exception:
+            price_f = 0.0
+
+        # chrtId -> остаток
+        cid = it.get("chrtId") or it.get("chrtID")
+        try:
+            cid_int = int(cid) if cid is not None else 0
+        except Exception:
+            cid_int = 0
+
+        ost_line = f"Остаток: {stocks_map[cid_int]} шт" if cid_int in stocks_map else "Остаток: -"
+
+        lines.append(
+            f"• {product_name}\n"
+            f"  Артикул: {vendor_code or '-'}\n"
+            f"  — {qty_int} шт • Покупка на сумму - {_rub(price_f)}\n"
+            f"  {ost_line}"
+        )
+
+        total_qty += qty_int
+        if price_f > 0:
+            total_sum += price_f * qty_int
+
+    if total_sum <= 0:
+        root_price = (
+            o.get("priceWithDisc")
+            or o.get("finishedPrice")
+            or o.get("forPay")
+            or o.get("totalPrice")
+            or o.get("price")
+            or 0
+        )
+        try:
+            total_sum = float(root_price)
+        except Exception:
+            total_sum = 0.0
+
+    body = (
+        f"📦 Склад отгрузки: {warehouse or '-'}\n"
+        + "\n".join(lines)
+        + f"\nИтого позиций: {total_qty}\n"
+        + f"Сумма: {_rub(total_sum)}\n"
+        + f"ID: {oid}"
+    )
+    return f"{header}\n{body}".strip()
+
+
+async def poll_marketplace_loop():
+    while True:
+        try:
+            orders = mp_fetch_new_orders()
+            for kind, o in orders:
+                if DEBUG_RAW_ORDERS:
+                    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
+                    if not was_sent(debug_key):
+                        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
+                        mark_sent(debug_key)
+
+                key = f"mp:{kind}:{o.get('_id','')}"
+                if was_sent(key):
+                    continue
+
+                res = tg_send(format_mp_order(kind, o))
+                if res.get("ok"):
+                    mark_sent(key)
+
+        except Exception as e:
+            ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
+            if not was_sent(ek):
+                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+                mark_sent(ek)
+
+        await asyncio.sleep(POLL_FBS_SECONDS)
 
 
 # -------------------------
@@ -754,31 +664,39 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or "WB"
     )
 
-    nm_id_raw = o.get("nmId")
-    try:
-        nm_id = int(float(nm_id_raw)) if nm_id_raw else None
-    except:
-        nm_id = None
+    nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
+    nm_id: Optional[int] = None
+    if nm_id_raw is not None:
+        try:
+            nm_id = int(float(nm_id_raw))  # иногда приходит как "537328918.0"
+        except Exception:
+            nm_id = None
 
-    barcode = _safe_str(o.get("barcode") or "")
+    barcode = _safe_str(o.get("barcode") or o.get("barCode") or "")
     article = _safe_str(o.get("supplierArticle") or "")
 
-    # базовое имя из statistics
-product_name = _safe_str(
-    o.get("nmName")
-    or o.get("productName")
-    or o.get("subjectName")
-    or o.get("subject")
-    or "Товар"
-)
+    # базовое имя из statistics (часто это “Расчески”)
+    product_name = _safe_str(
+        o.get("nmName")
+        or o.get("productName")
+        or o.get("subjectName")
+        or o.get("subject")
+        or "Товар"
+    )
 
-# ✅ всегда пытаемся подтянуть полное название по nmId
-if nm_id:
-    full_title = content_get_title(nm_id=nm_id, vendor_code=article)
-    if full_title:
-        product_name = full_title
+    # ✅ всегда тянем красивый title по nmId (как было “идеально”)
+    if nm_id:
+        full_title = content_get_title(nm_id=nm_id, vendor_code=article)
+        if full_title:
+            product_name = full_title
 
-    qty = int(o.get("quantity") or 1)
+    qty = o.get("quantity") or o.get("qty") or 1
+    try:
+        qty_int = int(qty)
+    except Exception:
+        qty_int = 1
+    if qty_int <= 0:
+        qty_int = 1
 
     price = (
         o.get("priceWithDisc")
@@ -789,25 +707,25 @@ if nm_id:
         or 0
     )
 
-    # 🔥 FBW остаток (как в разделе "Товары")
+    # Остаток FBW “как в Товарах”: берем quantity по складу+barcode из /supplier/stocks
     остаток_line = "Остаток: -"
     stock_q = fbw_stock_quantity(warehouse, barcode)
     if isinstance(stock_q, int):
         остаток_line = f"Остаток: {stock_q} шт"
 
-    header = f"📦 Заказ/движение (FBW/Statistics)\nsrid: {_safe_str(o.get('srid'))}"
+    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
 
-   body = (
-    f"📦 Склад отгрузки: {warehouse}\n"
-    f"• {product_name}\n"
-    f"  Артикул WB: {nm_id or '-'}\n"
-    f"  — {qty} шт • Покупка на сумму - {_rub(price)}\n"
-    f"{остаток_line}\n"
-    f"Итого позиций: {qty}\n"
-    f"Сумма: {_rub(price)}"
-)
+    body = (
+        f"📦 Склад отгрузки: {warehouse}\n"
+        f"• {product_name}\n"
+        f"  Артикул WB: {nm_id or '-'}\n"
+        f"  — {qty_int} шт • Покупка на сумму - {_rub(price)}\n"
+        f"{остаток_line}\n"
+        f"Итого позиций: {qty_int}\n"
+        f"Сумма: {_rub(price)}"
+    )
 
-    return f"{header}\n{body}"
+    return f"{header}\n{body}".strip()
 
 async def poll_fbw_loop():
     while True:
@@ -992,7 +910,12 @@ async def daily_summary_loop():
     while True:
         try:
             now = msk_now()
-            target = now.replace(hour=DAILY_SUMMARY_HOUR_MSK, minute=DAILY_SUMMARY_MINUTE_MSK, second=0, microsecond=0)
+            target = now.replace(
+                hour=DAILY_SUMMARY_HOUR_MSK,
+                minute=DAILY_SUMMARY_MINUTE_MSK,
+                second=0,
+                microsecond=0,
+            )
             if target <= now:
                 target += timedelta(days=1)
 
@@ -1043,21 +966,6 @@ def health():
 def test_telegram():
     return {"telegram_result": tg_send("✅ Тест: сообщение из Render")}
 
-@app.get("/poll-once")
-def poll_once():
-    result: Dict[str, Any] = {}
-
-    if WB_MP_TOKEN:
-        try:
-            orders = mp_fetch_new_orders()
-            result["marketplace_found"] = len(orders)
-        except Exception as e:
-            result["marketplace_error"] = str(e)
-    else:
-        result["marketplace"] = "no WB_MP_TOKEN"
-
-    return result
-
 @app.get("/ping-content")
 def ping_content():
     if not WB_CONTENT_TOKEN:
@@ -1066,10 +974,13 @@ def ping_content():
 
 @app.get("/test-title/{nm_id}")
 def test_title(nm_id: int):
-    return {
-        "nm_id": nm_id,
-        "title": content_get_title(nm_id=nm_id, vendor_code="")
-    }
+    return {"nm_id": nm_id, "title": content_get_title(nm_id=nm_id, vendor_code="")}
+
+@app.get("/clear-cache")
+def clear_cache():
+    _TITLE_CACHE.clear()
+    _SIZES_CACHE.clear()
+    return {"ok": True, "cache": "cleared"}
 
 @app.get("/mp-warehouses")
 def mp_warehouses():
@@ -1091,7 +1002,7 @@ def test_stocks():
     kind, o = orders[0]
     items = _extract_items_from_mp_order(o)
 
-    chrt_ids = []
+    chrt_ids: List[int] = []
     for it in items:
         cid = it.get("chrtId") or it.get("chrtID")
         try:
@@ -1111,87 +1022,23 @@ def test_stocks():
         }
 
     stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
-    return {
-        "ok": True,
-        "kind": kind,
-        "warehouse_id": SELLER_WAREHOUSE_ID,
-        "chrt_ids": chrt_ids,
-        "stocks": stocks,
-    }
-
-@app.get("/stocks-all/{nm_id}")
-def stocks_all(nm_id: int):
-    if not WB_MP_TOKEN:
-        return {"ok": False, "error": "no WB_MP_TOKEN"}
-    if not WB_CONTENT_TOKEN:
-        return {"ok": False, "error": "no WB_CONTENT_TOKEN"}
-
-    # 1) получаем варианты (chrtId) из карточки
-    sizes = content_get_sizes(int(nm_id))
-    chrt_ids = [int(s["chrtId"]) for s in sizes if isinstance(s, dict) and s.get("chrtId")]
-    chrt_ids = list({x for x in chrt_ids if x > 0})
-
-    if not chrt_ids:
-        return {"ok": False, "error": "no chrtIds for this nmId", "nm_id": nm_id}
-
-    # 2) получаем склады продавца
-    whs = wb_get(f"{WB_MARKETPLACE_BASE}/api/v3/warehouses", WB_MP_TOKEN)
-    if not isinstance(whs, list):
-        return {"ok": False, "error": "cannot get warehouses", "raw": whs}
-
-    out = []
-    for w in whs:
-        if not isinstance(w, dict):
-            continue
-        wid = w.get("id")
-        name = w.get("name")
-        try:
-            wid_int = int(wid)
-        except Exception:
-            continue
-
-        stocks = mp_get_inventory_map(str(wid_int), chrt_ids)
-        out.append({
-            "warehouseId": wid_int,
-            "name": name,
-            "stocks": stocks,  # {chrtId: amount}
-        })
-
-    return {"ok": True, "nm_id": nm_id, "chrt_ids": chrt_ids, "warehouses": out}
+    return {"ok": True, "kind": kind, "warehouse_id": SELLER_WAREHOUSE_ID, "chrt_ids": chrt_ids, "stocks": stocks}
 
 @app.get("/test-fbw-stocks")
 def test_fbw_stocks():
     if not WB_STATS_TOKEN:
         return {"ok": False, "error": "no WB_STATS_TOKEN"}
-
-    # отчёт остатков (FBW) — берём с сегодняшней даты (можно вчера, если пусто)
     date_from = datetime.utcnow().strftime("%Y-%m-%d")
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/stocks"
     return wb_get(url, WB_STATS_TOKEN, params={"dateFrom": date_from})
-    
-@app.get("/clear-cache")
-def clear_cache():
-    _TITLE_CACHE.clear()
-    return {"ok": True, "title_cache": "cleared"}
 
-def fix_mojibake(s: str) -> str:
-    s = _safe_str(s)
-    if not s:
-        return ""
 
-    try:
-        # универсальное лечение UTF-8 → latin1 → unicode
-        return s.encode("latin1").decode("utf-8")
-    except Exception:
-        return s
-    
 # -------------------------
 # Startup: background tasks
 # -------------------------
 @app.on_event("startup")
 async def startup():
     _ = db()
-
     prime_feedbacks_silently()
 
     asyncio.create_task(poll_marketplace_loop())
