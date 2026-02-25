@@ -58,32 +58,24 @@ def _safe_str(x) -> str:
     return "" if x is None else str(x).strip()
 
 def fix_mojibake(s: str) -> str:
-    """
-    Лечит типичные кракозябры WB вида "Р Р°С..." и "Ð..." .
-    Безопасно: если не получилось — вернет исходное.
-    """
     s = _safe_str(s)
     if not s:
         return ""
 
-    # 1) Частый кейс WB: UTF-8 байты прочитали как CP1251 -> "Р°С..."
-    if any(x in s for x in ("Р°", "Рќ", "Рџ", "СЃ", "С‚", "СЏ", "Рё", "Рѕ", "Рµ")):
+    # типичная "кракозябра" WB: "РќР°С..."
+    if "Р" in s or "С" in s:
+        # 1) UTF-8 прочитали как CP1251
         try:
-            fixed = s.encode("cp1251", errors="ignore").decode("utf-8", errors="ignore").strip()
-            if fixed:
-                # поправка редкого глюка, когда первая буква теряется и получается "асческа"
-                if fixed.startswith("ас") and ("Р°С" in s or "СЃС" in s):
-                    fixed = "р" + fixed
-                return fixed
+            t = s.encode("cp1251").decode("utf-8")
+            if t and ("Р" not in t):
+                return t
         except Exception:
             pass
-
-    # 2) Другой популярный кейс: UTF-8 прочитали как latin1 -> "Ð..."
-    if "Ð" in s or "Ñ" in s:
+        # 2) UTF-8 прочитали как latin1
         try:
-            fixed = s.encode("latin1", errors="ignore").decode("utf-8", errors="ignore").strip()
-            if fixed:
-                return fixed
+            t = s.encode("latin1").decode("utf-8")
+            if t and ("Р" not in t):
+                return t
         except Exception:
             pass
 
