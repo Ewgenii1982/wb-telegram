@@ -221,22 +221,29 @@ def _decode_json_from_response(r: requests.Response) -> Any:
 
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
+
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
 
+    # ✅ обработка лимита
+    if r.status_code == 429:
+        retry = r.headers.get("X-Ratelimit-Retry")
+        try:
+            wait_s = int(float(retry)) if retry is not None else 2
+        except Exception:
+            wait_s = 2
+        time.sleep(max(1, min(wait_s, 30)))  # не спим бесконечно
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+
     if r.status_code >= 400:
-        return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
+        return {
+            "__error__": True,
+            "status_code": r.status_code,
+            "url": r.url,
+            "response_text": r.text,
+            "ratelimit_retry": r.headers.get("X-Ratelimit-Retry"),
+            "ratelimit_reset": r.headers.get("X-Ratelimit-Reset"),
+        }
 
-    # ✅ ВАЖНО: парсим JSON из байтов, не через r.json()
-    return _decode_json_from_response(r)
-
-def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
-    headers = {"Authorization": token}
-    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-
-    if r.status_code >= 400:
-        return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
-
-    # ✅ ВАЖНО: парсим JSON из байтов, не через r.json()
     return _decode_json_from_response(r)
 
 
