@@ -827,7 +827,12 @@ def ping_content():
         return {"ok": False, "error": "WB_CONTENT_TOKEN is not set"}
     return wb_get("https://content-api.wildberries.ru/ping", WB_CONTENT_TOKEN)
 
-
+@app.get("/mp-warehouses")
+def mp_warehouses():
+    if not WB_MP_TOKEN:
+        return {"ok": False, "error": "no WB_MP_TOKEN"}
+    return wb_get(f"{WB_MARKETPLACE_BASE}/api/v3/warehouses", WB_MP_TOKEN)
+    
 # -------------------------
 # Startup: background tasks
 # -------------------------
