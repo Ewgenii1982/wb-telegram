@@ -449,7 +449,7 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         lines.append(
             f"• {product_name}\n"
             f"  Артикул: {vendor_code or '-'}\n"
-            f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
+            f"  — {qty_int} шт • цена продажи - {_rub(price_f)}\n"
             f"  {ost_line}"
         )
 
@@ -568,7 +568,7 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         f"📦 Склад отгрузки: {warehouse}\n"
         f"• {product_name}\n"
         f"  Артикул: {article}\n"
-        f"  — {qty} шт • цена покупателя - {_rub(price)}\n"
+        f"  — {qty} шт • цена продажи - {_rub(price)}\n"
         f"{остаток_line}\n"
         f"Итого позиций: 1\n"
         f"Сумма: {_rub(price)}"
