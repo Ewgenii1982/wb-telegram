@@ -193,6 +193,7 @@ def tg_send(text: str) -> Dict[str, Any]:
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
+    r.encoding = "utf-8"  # ✅ ВОТ ЭТО
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
     try:
@@ -203,6 +204,7 @@ def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 2
 def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
     r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    r.encoding = "utf-8"  # ✅ И ВОТ ЭТО
     if r.status_code >= 400:
         return {"__error__": True, "status_code": r.status_code, "url": r.url, "response_text": r.text}
     try:
@@ -1096,6 +1098,10 @@ def test_fbw_stocks():
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/stocks"
     return wb_get(url, WB_STATS_TOKEN, params={"dateFrom": date_from})
     
+@app.get("/clear-cache")
+def clear_cache():
+    _TITLE_CACHE.clear()
+    return {"ok": True, "title_cache": "cleared"}
     
 # -------------------------
 # Startup: background tasks
