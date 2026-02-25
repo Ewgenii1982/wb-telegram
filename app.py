@@ -23,6 +23,8 @@ DB_PATH = os.getenv("DB_PATH", "/tmp/wb_telegram.sqlite").strip()
 POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "60"))
 
 WB_STATISTICS_BASE = "https://statistics-api.wildberries.ru"
+WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()
+WB_CONTENT_BASE = "https://content-api.wildberries.ru"
 
 
 # =========================
@@ -119,7 +121,32 @@ def tg_send(text: str):
         "disable_web_page_preview": True
     }, timeout=25)
 
+def content_get_title(nm_id: int) -> str:
+    if not WB_CONTENT_TOKEN or not nm_id:
+        return ""
 
+    url = f"{WB_CONTENT_BASE}/content/v2/get/cards/list"
+
+    payload = {
+        "settings": {
+            "filter": {"textSearch": str(nm_id)},
+            "cursor": {"limit": 1}
+        }
+    }
+
+    headers = {"Authorization": WB_CONTENT_TOKEN}
+    r = requests.post(url, headers=headers, json=payload, timeout=25)
+
+    if r.status_code != 200:
+        return ""
+
+    data = r.json()
+    cards = data.get("cards")
+    if not cards:
+        return ""
+
+    return cards[0].get("title", "")
+    
 # =========================
 # WB REQUEST
 # =========================
