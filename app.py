@@ -1028,8 +1028,13 @@ def test_questions():
         return {"ok": False, "error": "no WB_FEEDBACKS_TOKEN"}
 
     url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
-    return wb_get(url, WB_FEEDBACKS_TOKEN, params={"take": 20, "skip": 0})
 
+    # WB требует isAnswered, обычно "true"/"false"
+    out = {
+        "isAnswered=false": wb_get(url, WB_FEEDBACKS_TOKEN, params={"isAnswered": "false", "take": 20, "skip": 0}),
+        "isAnswered=true": wb_get(url, WB_FEEDBACKS_TOKEN, params={"isAnswered": "true", "take": 20, "skip": 0}),
+    }
+    return out
 
 # -------------------------
 # Startup
