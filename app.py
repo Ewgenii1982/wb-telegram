@@ -638,21 +638,19 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
 def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB")
 
-    # nmId из statistics
     nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
     nm_id: Optional[int] = None
     if nm_id_raw is not None:
         try:
-            nm_id = int(float(nm_id_raw))  # иногда приходит как "537328918.0"
+            nm_id = int(float(nm_id_raw))  # иногда "537328918.0"
         except Exception:
             nm_id = None
 
     article = _safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or "")
 
-    # то, что пришло из statistics (часто это категория/коротко)
     product_name = _safe_str(o.get("nmName") or o.get("productName") or o.get("subject") or "Товар")
 
-    # ✅ Подтягиваем полное наименование из Content API по nmId
+    # ✅ Полное название из Content API
     if nm_id:
         full_title = content_get_title(nm_id=nm_id, vendor_code=article)
         if full_title:
@@ -676,14 +674,14 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     is_cancel = o.get("isCancel", False)
     cancel_txt = " ❌ ОТМЕНА" if str(is_cancel).lower() in ("1", "true", "yes") else ""
 
-    # Остаток для FBW мы не считаем (это склад WB)
+    # ✅ Остаток (именно вариант) через chrtId -> stocks
     остаток_line = "Остаток: -"
-if SELLER_WAREHOUSE_ID and WB_MP_TOKEN and nm_id:
-    chrt_id = resolve_chrt_id_from_stats_order(o, nm_id)
-    if chrt_id:
-        stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, [chrt_id])
-        if chrt_id in stocks:
-            остаток_line = f"Остаток: {stocks[chrt_id]} шт"
+    if SELLER_WAREHOUSE_ID and WB_MP_TOKEN and nm_id:
+        chrt_id = resolve_chrt_id_from_stats_order(o, nm_id)
+        if chrt_id:
+            stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, [chrt_id])
+            if chrt_id in stocks:
+                остаток_line = f"Остаток: {stocks[chrt_id]} шт"
 
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}{cancel_txt}"
     body = (
@@ -958,48 +956,6 @@ def mp_warehouses():
     if not WB_MP_TOKEN:
         return {"ok": False, "error": "no WB_MP_TOKEN"}
     return wb_get(f"{WB_MARKETPLACE_BASE}/api/v3/warehouses", WB_MP_TOKEN)
-
-@app.get("/test-stocks")
-def test_stocks():
-    if not WB_MP_TOKEN:
-        return {"ok": False, "error": "no WB_MP_TOKEN"}
-    if not SELLER_WAREHOUSE_ID:
-        return {"ok": False, "error": "no SELLER_WAREHOUSE_ID"}
-
-    orders = mp_fetch_new_orders()
-    if not orders:
-        return {"ok": False, "error": "no new orders right now"}
-
-    kind, o = orders[0]
-    items = _extract_items_from_mp_order(o)
-
-    chrt_ids = []
-    for it in items:
-        cid = it.get("chrtId") or it.get("chrtID")
-        try:
-            ci = int(cid) if cid is not None else 0
-        except Exception:
-            ci = 0
-        if ci > 0:
-            chrt_ids.append(ci)
-
-    if not chrt_ids:
-        return {
-            "ok": False,
-            "error": "order has no chrtId -> cannot request stocks",
-            "kind": kind,
-            "order_keys": list(o.keys()),
-            "item_keys": list(items[0].keys()) if items else [],
-        }
-
-    stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
-    return {
-        "ok": True,
-        "kind": kind,
-        "warehouse_id": SELLER_WAREHOUSE_ID,
-        "chrt_ids": chrt_ids,
-        "stocks": stocks,
-    }
 
 @app.get("/test-stocks")
 def test_stocks():
