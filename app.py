@@ -22,7 +22,7 @@ WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()         # statistics-ap
 WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip() # feedbacks-api (reviews)
 WB_WEBHOOK_SECRET = os.getenv("WB_WEBHOOK_SECRET", "").strip()
 
-# ⬇️ токен WB Content API (для полного названия товара)
+# токен WB Content API (для полного названия товара)
 WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()
 
 SHOP_NAME = os.getenv("SHOP_NAME", "Bright Shop").strip()
@@ -259,6 +259,7 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
     _STOCKS_CACHE[cache_key] = (now, out)
     return out
 
+
 # -------------------------
 # Content API: полное наименование товара (title) — кеш
 # -------------------------
@@ -298,64 +299,6 @@ def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str
     if not isinstance(cards, list) or not cards:
         return ""
 
-    # если искали по nmId — попробуем точное совпадение
-    if nm_id:
-        for c in cards:
-            if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
-                title = _safe_str(c.get("title"))
-                if title:
-                    _TITLE_CACHE[key] = (now, title)
-                    return title
-
-    title = _safe_str(cards[0].get("title")) if isinstance(cards[0], dict) else ""
-    if title:
-        _TITLE_CACHE[key] = (now, title)
-    return title
-# -------------------------
-# Content API: полное наименование (title) — кеш
-# -------------------------
-_TITLE_CACHE: Dict[str, Tuple[float, str]] = {}
-_TITLE_CACHE_TTL = 24 * 3600  # 24 часа
-
-def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str:
-    if not WB_CONTENT_TOKEN:
-        return ""
-
-    key = f"nm:{nm_id}" if nm_id else f"vc:{vendor_code}"
-    now = time.time()
-
-    if key in _TITLE_CACHE:
-        ts, title = _TITLE_CACHE[key]
-        if now - ts <= _TITLE_CACHE_TTL:
-            return title
-
-    text_search = ""
-    if nm_id:
-        text_search = str(nm_id)
-    else:
-        text_search = _safe_str(vendor_code)
-
-    if not text_search:
-        return ""
-
-    url = f"{WB_CONTENT_BASE}/content/v2/get/cards/list"
-    payload = {
-        "settings": {
-            "sort": {"ascending": False},
-            "filter": {"textSearch": text_search, "withPhoto": -1},
-            "cursor": {"limit": 10}
-        }
-    }
-
-    data = wb_post(url, WB_CONTENT_TOKEN, payload=payload)
-    if isinstance(data, dict) and data.get("__error__"):
-        return ""
-
-    cards = data.get("cards") if isinstance(data, dict) else None
-    if not isinstance(cards, list) or not cards:
-        return ""
-
-    # если искали по nmId — попробуем точное совпадение
     if nm_id:
         for c in cards:
             if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
@@ -448,32 +391,21 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
     for it in items:
         subject = _safe_str(it.get("subject") or it.get("subjectName"))
-    vendor_code = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
+        vendor_code = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
 
-    product_name = pick_full_product_name(it)  # что пришло из заказа
+        # что пришло из заказа
+        product_name = pick_best_name_from_order(it)
 
-    # nmId из заказа (если есть)
-    nm_id_raw = it.get("nmId") or it.get("nmID")
-nm_id = None
-if nm_id_raw is not None:
-    try:
-        nm_id = int(nm_id_raw)
-    except Exception:
-        nm_id = None
-
-# если вместо названия пришла категория (например, "Расчески") — тянем полное имя из карточки
-if subject and product_name == subject:
-    full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
-    if full_title:
-        product_name = full_title  # ← вот это и есть правильная подмена
-
-        # 2) если пришла только категория (subject), дотягиваем полное название из Content API
+        # nmId из заказа (если есть) — БЕЗ “сломанных try”
         nm_id_raw = it.get("nmId") or it.get("nmID")
-        try:
-            nm_id = int(nm_id_raw) if nm_id_raw is not None else None
-        except Exception:
-            nm_id = None
+        nm_id: Optional[int] = None
+        if nm_id_raw is not None:
+            try:
+                nm_id = int(nm_id_raw)
+            except Exception:
+                nm_id = None
 
+        # если вместо названия пришла категория — тянем title из карточки
         if subject and product_name == subject:
             full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
             if full_title:
@@ -513,10 +445,10 @@ if subject and product_name == subject:
 
         lines.append(
             f"• {product_name}\n"
-        f"  Артикул: {vendor_code or '-'}\n"
-        f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
-        f"  {ost_line}"
-    )
+            f"  Артикул: {vendor_code or '-'}\n"
+            f"  — {qty_int} шт • цена покупателя - {_rub(price_f)}\n"
+            f"  {ost_line}"
+        )
 
         total_qty += qty_int
         if price_f > 0:
@@ -575,7 +507,7 @@ async def poll_marketplace_loop():
 
 
 # -------------------------
-# FBW: Statistics (orders) + feedbacks + daily summary (как у тебя было)
+# FBW: Statistics (orders)
 # -------------------------
 def msk_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=3)))
@@ -668,6 +600,9 @@ async def poll_fbw_loop():
         await asyncio.sleep(POLL_FBW_SECONDS)
 
 
+# -------------------------
+# Feedbacks (reviews)
+# -------------------------
 def feedbacks_fetch_latest() -> List[Dict[str, Any]]:
     if not WB_FEEDBACKS_TOKEN:
         return []
@@ -769,6 +704,9 @@ async def poll_feedbacks_loop():
         await asyncio.sleep(POLL_FEEDBACKS_SECONDS)
 
 
+# -------------------------
+# Daily summary (sales + returns)
+# -------------------------
 def daily_summary_text(today: datetime) -> str:
     if not WB_STATS_TOKEN:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
@@ -870,7 +808,7 @@ def test_telegram():
 
 @app.get("/poll-once")
 def poll_once():
-    result = {}
+    result: Dict[str, Any] = {}
 
     if WB_MP_TOKEN:
         try:
@@ -887,8 +825,9 @@ def poll_once():
 def ping_content():
     if not WB_CONTENT_TOKEN:
         return {"ok": False, "error": "WB_CONTENT_TOKEN is not set"}
-
     return wb_get("https://content-api.wildberries.ru/ping", WB_CONTENT_TOKEN)
+
+
 # -------------------------
 # Startup: background tasks
 # -------------------------
