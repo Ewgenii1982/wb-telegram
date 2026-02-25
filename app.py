@@ -832,6 +832,48 @@ def mp_warehouses():
     if not WB_MP_TOKEN:
         return {"ok": False, "error": "no WB_MP_TOKEN"}
     return wb_get(f"{WB_MARKETPLACE_BASE}/api/v3/warehouses", WB_MP_TOKEN)
+
+@app.get("/test-stocks")
+def test_stocks():
+    if not WB_MP_TOKEN:
+        return {"ok": False, "error": "no WB_MP_TOKEN"}
+    if not SELLER_WAREHOUSE_ID:
+        return {"ok": False, "error": "no SELLER_WAREHOUSE_ID"}
+
+    orders = mp_fetch_new_orders()
+    if not orders:
+        return {"ok": False, "error": "no new orders right now"}
+
+    kind, o = orders[0]
+    items = _extract_items_from_mp_order(o)
+
+    chrt_ids = []
+    for it in items:
+        cid = it.get("chrtId") or it.get("chrtID")
+        try:
+            ci = int(cid) if cid is not None else 0
+        except Exception:
+            ci = 0
+        if ci > 0:
+            chrt_ids.append(ci)
+
+    if not chrt_ids:
+        return {
+            "ok": False,
+            "error": "order has no chrtId -> cannot request stocks",
+            "kind": kind,
+            "order_keys": list(o.keys()),
+            "item_keys": list(items[0].keys()) if items else [],
+        }
+
+    stocks = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
+    return {
+        "ok": True,
+        "kind": kind,
+        "warehouse_id": SELLER_WAREHOUSE_ID,
+        "chrt_ids": chrt_ids,
+        "stocks": stocks,
+    }
     
 # -------------------------
 # Startup: background tasks
