@@ -302,13 +302,24 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = _safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB")
 
     # nmId иногда приходит как 537328918 или 537328918.0
-    nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
-    nm_id: Optional[int] = None
-    if nm_id_raw is not None:
-        try:
-            nm_id = int(float(nm_id_raw))
-        except Exception:
-            nm_id = None
+    nm_id_raw = o.get("nmId")
+    try:
+    nm_id = int(float(nm_id_raw)) if nm_id_raw else None
+    except:
+    nm_id = None
+
+    # 1️⃣ сначала пытаемся получить title из Content API
+    product_name = content_get_title(nm_id)
+
+    # 2️⃣ если вдруг API не вернул — fallback
+    if not product_name:
+    product_name = _safe_str(
+        o.get("nmName")
+        or o.get("productName")
+        or o.get("subjectName")
+        or o.get("subject")
+        or "Товар"
+    )
 
     barcode = _safe_str(o.get("barcode") or o.get("barCode") or "")
     qty = o.get("quantity") or o.get("qty") or 1
