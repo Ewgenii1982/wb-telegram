@@ -62,22 +62,33 @@ def fix_mojibake(s: str) -> str:
     if not s:
         return ""
 
-    # типичная "кракозябра" WB: "РќР°С..."
-    if "Р" in s or "С" in s:
-        # 1) UTF-8 прочитали как CP1251
-        try:
-            t = s.encode("cp1251").decode("utf-8")
-            if t and ("Р" not in t):
-                return t
-        except Exception:
-            pass
-        # 2) UTF-8 прочитали как latin1
-        try:
-            t = s.encode("latin1").decode("utf-8")
-            if t and ("Р" not in t):
-                return t
-        except Exception:
-            pass
+    # если нет типичных маркеров — не трогаем
+    if ("Р" not in s) and ("С" not in s):
+        return s
+
+    # 1) Частый случай: UTF-8 байты прочитали как latin1 (получили "Р°...")
+    try:
+        b = s.encode("latin1", errors="strict")
+        # лечим вариант "Р Р°..." — когда между байтами затесались пробелы/NBSP
+        b = b.replace(b"\xC2\xA0", b"")  # UTF-8 NBSP последовательность
+        b = b.replace(b"\xA0", b"")      # NBSP одиночный
+        b = b.replace(b" ", b"")         # пробелы между байтами
+        t = b.decode("utf-8", errors="strict")
+        if t and ("Р" not in t) and ("С" not in t):
+            return t
+        return t  # даже если остались Р/С — иногда это уже нормальный русский (редко), но пусть
+    except Exception:
+        pass
+
+    # 2) Запасной вариант: UTF-8 байты прочитали как cp1251
+    try:
+        b = s.encode("cp1251", errors="strict")
+        b = b.replace(b"\xA0", b"").replace(b" ", b"")
+        t = b.decode("utf-8", errors="strict")
+        if t:
+            return t
+    except Exception:
+        pass
 
     return s
     
@@ -1136,6 +1147,16 @@ def test_questions():
         "isAnswered=true": wb_get(url, WB_FEEDBACKS_TOKEN, params={"isAnswered": "true", "take": 20, "skip": 0}),
     }
     return out
+
+@app.get("/debug-title/{nm_id}")
+def debug_title(nm_id: int):
+    raw = content_get_title(nm_id=nm_id, vendor_code="")
+    return {
+        "nm_id": nm_id,
+        "raw": raw,
+        "fixed": fix_mojibake(raw),
+        "raw_repr": repr(raw),
+    }
 
 # -------------------------
 # Startup
