@@ -1039,6 +1039,17 @@ def stocks_all(nm_id: int):
         })
 
     return {"ok": True, "nm_id": nm_id, "chrt_ids": chrt_ids, "warehouses": out}
+
+@app.get("/test-fbw-stocks")
+def test_fbw_stocks():
+    if not WB_STATS_TOKEN:
+        return {"ok": False, "error": "no WB_STATS_TOKEN"}
+
+    # отчёт остатков (FBW) — берём с сегодняшней даты (можно вчера, если пусто)
+    date_from = datetime.utcnow().strftime("%Y-%m-%d")
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/stocks"
+    return wb_get(url, WB_STATS_TOKEN, params={"dateFrom": date_from})
+    
     
 # -------------------------
 # Startup: background tasks
