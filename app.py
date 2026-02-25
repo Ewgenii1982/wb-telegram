@@ -443,21 +443,77 @@ def stats_fetch_fbw_stocks() -> List[Dict[str, Any]]:
     _FBW_STOCKS_CACHE = (now, data)
     return data
 
-def fbw_stock_quantity(warehouse: str, barcode: str) -> Optional[int]:
-    warehouse = fix_mojibake(_safe_str(warehouse))
-    barcode = _safe_str(barcode)
-    if not warehouse or not barcode:
-        return None
+def _norm_ws(s: str) -> str:
+    s = fix_mojibake(_safe_str(s)).lower()
+    return " ".join(s.replace("–", "-").replace("—", "-").split())
+
+def fbw_stock_quantity(warehouse: str, barcode: str, nm_id: Optional[int] = None, supplier_article: str = "") -> Optional[int]:
+    w = _norm_ws(warehouse)
+    bc = _safe_str(barcode)
+    sa = _norm_ws(supplier_article)
 
     rows = stats_fetch_fbw_stocks()
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        if fix_mojibake(_safe_str(r.get("warehouseName"))) == warehouse and _safe_str(r.get("barcode")) == barcode:
+    if not rows:
+        return None
+
+    def pick_qty(r: Dict[str, Any]) -> Optional[int]:
+        for k in ("quantityFull", "quantity", "QuantityFull", "Quantity"):
+            if k in r:
+                try:
+                    return int(r.get(k) or 0)
+                except Exception:
+                    pass
+        return None
+
+    # 1) точное: warehouse + barcode
+    if w and bc:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rw = _norm_ws(r.get("warehouseName"))
+            if rw == w and _safe_str(r.get("barcode")) == bc:
+                q = pick_qty(r)
+                if isinstance(q, int):
+                    return q
+
+    # 2) мягкое: warehouse содержит/входит + barcode
+    if w and bc:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rw = _norm_ws(r.get("warehouseName"))
+            if (w in rw or rw in w) and _safe_str(r.get("barcode")) == bc:
+                q = pick_qty(r)
+                if isinstance(q, int):
+                    return q
+
+    # 3) fallback: warehouse + nmId
+    if w and nm_id:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rw = _norm_ws(r.get("warehouseName"))
             try:
-                return int(r.get("quantity", 0))
+                r_nm = int(r.get("nmId") or r.get("nmID") or 0)
             except Exception:
-                return None
+                r_nm = 0
+            if (rw == w or w in rw or rw in w) and r_nm == int(nm_id):
+                q = pick_qty(r)
+                if isinstance(q, int):
+                    return q
+
+    # 4) fallback: warehouse + supplierArticle
+    if w and sa:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rw = _norm_ws(r.get("warehouseName"))
+            r_sa = _norm_ws(r.get("supplierArticle"))
+            if (rw == w or w in rw or rw in w) and r_sa and r_sa == sa:
+                q = pick_qty(r)
+                if isinstance(q, int):
+                    return q
+
     return None
 
 
@@ -716,7 +772,7 @@ def format_stats_order(o: Dict[str, Any]) -> str:
 
     # 🔥 FBW остаток (как в разделе "Товары")
     ostatok_line = "Остаток: -"
-    q = fbw_stock_quantity(warehouse, barcode)
+    q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
     if isinstance(q, int):
         ostatok_line = f"Остаток: {q} шт"
 
@@ -896,6 +952,101 @@ def prime_feedbacks_silently() -> None:
                 mark_sent(f"feedback:{fid}")
     except Exception:
         pass
+def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
+    if not WB_STATS_TOKEN:
+        return []
+
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
+    default_dt = msk_now() - timedelta(hours=4)
+    cursor = get_cursor(cursor_name, iso_msk(default_dt))
+
+    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": cursor, "flag": 1})
+    if isinstance(data, dict) and data.get("__error__"):
+        return [{"__error__": True, **data}]
+
+    if not isinstance(data, list) or not data:
+        return []
+
+    # сдвигаем курсор по lastChangeDate (если есть)
+    last = data[-1]
+    if isinstance(last, dict) and last.get("lastChangeDate"):
+        set_cursor(cursor_name, last["lastChangeDate"])
+
+    # фиксим текст
+    for r in data:
+        if isinstance(r, dict):
+            for k in ("warehouseName", "supplierArticle", "subject", "nmName", "category"):
+                if k in r:
+                    r[k] = fix_mojibake(_safe_str(r.get(k)))
+
+    return data
+
+def format_sale_event(s: Dict[str, Any]) -> str:
+    # saleID есть у продажи/выкупа; у возврата обычно будет отрицательная/иная логика, но WB путает — покажем по знаку forPay
+    warehouse = fix_mojibake(_safe_str(s.get("warehouseName") or "WB"))
+    nm_id = None
+    for k in ("nmId", "nmID", "nm_id"):
+        if s.get(k) is not None:
+            try:
+                nm_id = int(float(s.get(k)))
+                break
+            except Exception:
+                pass
+
+    supplier_article = fix_mojibake(_safe_str(s.get("supplierArticle") or ""))
+    name = fix_mojibake(_safe_str(s.get("nmName") or s.get("subject") or "Товар"))
+
+    if nm_id:
+        t = content_get_title(nm_id=nm_id, vendor_code=supplier_article)
+        if t:
+            name = t
+
+    price = s.get("forPay") or s.get("priceWithDisc") or s.get("finishedPrice") or 0
+    try:
+        price_f = float(price)
+    except Exception:
+        price_f = 0.0
+
+    created = _format_dt_ru(_safe_str(s.get("date") or s.get("lastChangeDate") or ""))
+
+    kind = "✅ Выкуп" if price_f >= 0 else "↩️ Возврат/отказ"
+    return (
+        f"{kind} · {SHOP_NAME}\n"
+        f"Склад: {warehouse}\n"
+        f"Товар: {name}\n"
+        f"Артикул WB: {nm_id or '-'}\n"
+        f"Сумма: {_rub(abs(price_f))}\n"
+        f"Дата: {created}"
+    ).strip()
+
+async def poll_sales_loop():
+    while True:
+        try:
+            rows = stats_fetch_sales_since("stats_sales_cursor")
+            if rows and isinstance(rows[0], dict) and rows[0].get("__error__"):
+                ek = f"err:stats_sales:{rows[0].get('status_code')}:{rows[0].get('url','')}"
+                if not was_sent(ek):
+                    tg_send(f"⚠️ statistics sales error: {rows[0].get('status_code')} {rows[0].get('response_text','')[:300]}")
+                    mark_sent(ek)
+            else:
+                for s in rows:
+                    if not isinstance(s, dict):
+                        continue
+                    sid = _safe_str(s.get("saleID") or s.get("saleId") or "")
+                    # если saleID пустой — всё равно можем дедупить по составному ключу
+                    key = f"sale:{sid}:{_safe_str(s.get('lastChangeDate'))}:{_safe_str(s.get('srid'))}:{_safe_str(s.get('barcode'))}"
+                    if was_sent(key):
+                        continue
+                    res = tg_send(format_sale_event(s))
+                    if res.get("ok"):
+                        mark_sent(key)
+        except Exception as e:
+            ek = f"err:sales:{type(e).__name__}:{str(e)[:160]}"
+            if not was_sent(ek):
+                tg_send(f"⚠️ Ошибка sales polling: {e}")
+                mark_sent(ek)
+
+        await asyncio.sleep(120)
 
 
 # -------------------------
@@ -1157,7 +1308,10 @@ def debug_title(nm_id: int):
         "fixed": fix_mojibake(raw),
         "raw_repr": repr(raw),
     }
-
+@app.get("/debug-title/{nm_id}")
+def debug_title(nm_id: int):
+    raw = content_get_title(nm_id=nm_id, vendor_code="")
+    return {"nm_id": nm_id, "raw": raw, "fixed": fix_mojibake(raw), "raw_repr": repr(raw)}
 # -------------------------
 # Startup
 # -------------------------
@@ -1167,6 +1321,7 @@ async def startup():
     prime_feedbacks_silently()
 
     asyncio.create_task(poll_marketplace_loop())
+    asyncio.create_task(poll_sales_loop())
     asyncio.create_task(poll_feedbacks_loop())
     asyncio.create_task(poll_fbw_loop())
     asyncio.create_task(daily_summary_loop())
