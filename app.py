@@ -990,6 +990,13 @@ def ping_content():
         return {"ok": False, "error": "WB_CONTENT_TOKEN is not set"}
     return wb_get("https://content-api.wildberries.ru/ping", WB_CONTENT_TOKEN)
 
+@app.get("/test-title/{nm_id}")
+def test_title(nm_id: int):
+    return {
+        "nm_id": nm_id,
+        "title": content_get_title(nm_id=nm_id, vendor_code="")
+    }
+
 @app.get("/mp-warehouses")
 def mp_warehouses():
     if not WB_MP_TOKEN:
