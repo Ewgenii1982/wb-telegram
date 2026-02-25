@@ -21,6 +21,8 @@ WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()               # marketplace-a
 WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()         # statistics-api (FBW)
 WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip() # feedbacks-api (reviews)
 WB_WEBHOOK_SECRET = os.getenv("WB_WEBHOOK_SECRET", "").strip()
+WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()
+WB_CONTENT_BASE = "https://content-api.wildberries.ru"
 
 SHOP_NAME = os.getenv("SHOP_NAME", "Bright Shop").strip()
 
@@ -357,14 +359,21 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
     for it in items:
         subject = _safe_str(it.get("subject") or it.get("subjectName"))
-        article = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
+article = _safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or "")
 
-        # пробуем вытащить длинное имя
-        product_name = pick_full_product_name(it)
+product_name = pick_full_product_name(it)
 
-        # если WB дал только "subject" (категорию), а полного имени нет — используем артикул как название
-        if product_name and subject and product_name == subject and article:
-            product_name = article
+# если WB отдал только категорию, пробуем дотянуть полное название из Content API
+nm_id_raw = it.get("nmId") or it.get("nmID")
+try:
+    nm_id = int(nm_id_raw) if nm_id_raw is not None else None
+except Exception:
+    nm_id = None
+
+if product_name and subject and product_name == subject:
+    full_title = content_get_title(nm_id=nm_id, vendor_code=article)
+    if full_title:
+        product_name = full_title
 
         qty = it.get("quantity") or it.get("qty") or 1
         try:
@@ -558,7 +567,72 @@ async def poll_fbw_loop():
 
         await asyncio.sleep(POLL_FBW_SECONDS)
 
+# -------------------------
+# Content API: title по nmId / vendorCode (кеш)
+# -------------------------
+_TITLE_CACHE: Dict[str, Tuple[float, str]] = {}
+_TITLE_CACHE_TTL = 24 * 3600  # 24 часа
 
+def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str:
+    """
+    Возвращает title (полное наименование) из карточки товара.
+    Ищем по nmId (лучше) или по vendorCode (артикул продавца).
+    """
+    if not WB_CONTENT_TOKEN:
+        return ""
+
+    key = f"nm:{nm_id}" if nm_id else f"vc:{vendor_code}"
+    now = time.time()
+
+    if key in _TITLE_CACHE:
+        ts, title = _TITLE_CACHE[key]
+        if now - ts <= _TITLE_CACHE_TTL:
+            return title
+
+    text_search = ""
+    if nm_id:
+        text_search = str(nm_id)
+    else:
+        text_search = _safe_str(vendor_code)
+
+    if not text_search:
+        return ""
+
+    url = f"{WB_CONTENT_BASE}/content/v2/get/cards/list"
+    payload = {
+        "settings": {
+            "sort": {"ascending": False},
+            "filter": {
+                "textSearch": text_search,
+                "withPhoto": -1
+            },
+            "cursor": {"limit": 10}
+        }
+    }
+
+    data = wb_post(url, WB_CONTENT_TOKEN, payload=payload)
+    if isinstance(data, dict) and data.get("__error__"):
+        return ""
+
+    # по доке ответ: {"cards":[{"title":"...", "nmID":...}], ...}  [oai_citation:0‡WB API](https://dev.wildberries.ru/docs/openapi/work-with-products)
+    cards = data.get("cards") if isinstance(data, dict) else None
+    if not isinstance(cards, list) or not cards:
+        return ""
+
+    # если искали по nmId — найдём точное совпадение
+    if nm_id:
+        for c in cards:
+            if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
+                title = _safe_str(c.get("title"))
+                if title:
+                    _TITLE_CACHE[key] = (now, title)
+                    return title
+
+    # иначе берём первый title
+    title = _safe_str(cards[0].get("title")) if isinstance(cards[0], dict) else ""
+    if title:
+        _TITLE_CACHE[key] = (now, title)
+    return title
 # -------------------------
 # Feedbacks (reviews)
 # -------------------------
