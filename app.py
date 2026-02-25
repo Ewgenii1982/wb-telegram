@@ -180,6 +180,7 @@ def tg_send(text: str) -> Dict[str, Any]:
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=payload, timeout=25)
+    r.encoding = "utf-8"
     try:
         return r.json()
     except Exception:
