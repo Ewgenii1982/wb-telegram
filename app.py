@@ -411,7 +411,7 @@ async def poll_marketplace_loop():
     while True:
         try:
             orders = mp_fetch_new_orders()
-            ffor kind, o in orders:
+            for kind, o in orders:
     debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
     if not was_sent(debug_key):
         tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
