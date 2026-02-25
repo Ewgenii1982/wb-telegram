@@ -763,12 +763,20 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     barcode = _safe_str(o.get("barcode") or "")
     article = _safe_str(o.get("supplierArticle") or "")
 
-    product_name = _safe_str(
-        o.get("nmName")
-        or o.get("productName")
-        or o.get("subject")
-        or "Товар"
-    )
+    # базовое имя из statistics
+product_name = _safe_str(
+    o.get("nmName")
+    or o.get("productName")
+    or o.get("subjectName")
+    or o.get("subject")
+    or "Товар"
+)
+
+# ✅ всегда пытаемся подтянуть полное название по nmId
+if nm_id:
+    full_title = content_get_title(nm_id=nm_id, vendor_code=article)
+    if full_title:
+        product_name = full_title
 
     qty = int(o.get("quantity") or 1)
 
@@ -787,14 +795,16 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     if isinstance(stock_q, int):
         остаток_line = f"Остаток: {stock_q} шт"
 
-    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
+    header = f"📦 Заказ/движение (FBW/Statistics)\nsrid: {_safe_str(o.get('srid'))}"
 
-    body = (
-    f"📦 Склад отгрузки: {warehouse or '-'}\n"
-    + "\n".join(lines)
-    + f"\nИтого позиций: {total_qty}\n"
-    + f"Сумма: {_rub(total_sum)}\n"
-    + f"ID: {oid}"
+   body = (
+    f"📦 Склад отгрузки: {warehouse}\n"
+    f"• {product_name}\n"
+    f"  Артикул WB: {nm_id or '-'}\n"
+    f"  — {qty} шт • Покупка на сумму - {_rub(price)}\n"
+    f"{остаток_line}\n"
+    f"Итого позиций: {qty}\n"
+    f"Сумма: {_rub(price)}"
 )
 
     return f"{header}\n{body}"
