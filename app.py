@@ -469,12 +469,14 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
             total_sum = 0.0
 
     body = (
-        f"📦 Склад отгрузки: {warehouse or '-'}\n"
-        + "\n".join(lines)
-        + f"\nИтого позиций: {total_qty}\n"
-        + f"Сумма: {_rub(total_sum)}\n"
-        + f"ID: {oid}"
-    )
+    f"📦 Склад отгрузки: {warehouse}\n"
+    f"• {product_name}\n"
+    f"  Артикул: {nm_id or '-'}\n"
+    f"  — {qty_int} шт • цена покупателя - {_rub(price)}\n"
+    f"{остаток_line}\n"
+    f"Итого позиций: {qty_int}\n"
+    f"Сумма: {_rub(price)}"
+)
     return f"{header}\n{body}".strip()
 
 
@@ -687,8 +689,7 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     body = (
         f"📦 Склад отгрузки: {warehouse}\n"
         f"• {product_name}\n"
-        f"  Артикул: {article or '-'}\n"
-        f"  nmId: {nm_id or '-'}\n"
+        f"  Артикул WB: {nm_id or '-'}\n"
         f"  — {qty_int} шт • цена покупателя - {_rub(price)}\n"
         f"{остаток_line}\n"
         f"Итого позиций: {qty_int}\n"
