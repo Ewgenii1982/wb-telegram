@@ -411,18 +411,19 @@ async def poll_marketplace_loop():
     while True:
         try:
             orders = mp_fetch_new_orders()
-            for kind, o in orders:
-                key = f"mp:{kind}:{o.get('_id','')}"
-                if was_sent(key):
-                    continue
-                res = tg_send(format_mp_order(kind, o))
-                if res.get("ok"):
-                    mark_sent(key)
-        except Exception as e:
-            ek = f"err:mp:{type(e).__name__}:{str(e)[:120]}"
-            if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
-                mark_sent(ek)
+            ffor kind, o in orders:
+    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
+    if not was_sent(debug_key):
+        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
+        mark_sent(debug_key)
+
+    key = f"mp:{kind}:{o.get('_id','')}"
+    if was_sent(key):
+        continue
+
+    res = tg_send(format_mp_order(kind, o))
+    if res.get("ok"):
+        mark_sent(key)
 
         await asyncio.sleep(POLL_FBS_SECONDS)
 
