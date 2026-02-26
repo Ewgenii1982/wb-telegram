@@ -855,6 +855,7 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
 
 def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = fix_mojibake(_safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB"))
+    warehouse_type = fix_mojibake(_safe_str(o.get("warehouseType") or ""))
 
     nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
     nm_id: Optional[int] = None
@@ -897,76 +898,48 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or 0
     )
 
+    is_cancel = bool(o.get("isCancel"))
+    cancel_dt = _format_dt_ru(_safe_str(o.get("cancelDate") or "")) if is_cancel else ""
+    created = _format_dt_ru(_safe_str(o.get("date") or o.get("lastChangeDate") or ""))
+
     # Остаток:
-    # - для заказов со склада продавца лучше считать через Marketplace Seller Warehouses stocks
-    #   (POST /api/v3/stocks/{warehouseId}), потому что statistics /supplier/stocks — про склады WB.
+    # - для "Склад продавца" считаем через Marketplace Seller Warehouses stocks (POST /api/v3/stocks/{warehouseId})
+    # - для WB-складов оставляем fallback через statistics /supplier/stocks
     ostatok_line = "Остаток: -"
-    chrt_id = resolve_chrt_id(nm_id, barcode)
 
-    # Пробуем подобрать warehouseId по имени склада из statistics.
-    wid = mp_pick_warehouse_id_by_name(warehouse) if warehouse else None
-    inv_wid = str(wid) if wid else SELLER_WAREHOUSE_ID
+    if warehouse_type.lower().find("склад продавца") >= 0 or not warehouse_type:
+        chrt_id = resolve_chrt_id(nm_id, barcode)
 
-    if inv_wid and chrt_id:
-        sm = mp_get_inventory_map(inv_wid, [chrt_id])
-        if chrt_id in sm:
-            ostatok_line = f"Остаток: {sm[chrt_id]} шт"
-    else:
-        # fallback: если это реально FBW (WB-склад), оставляем старую логику
+        wid = mp_pick_warehouse_id_by_name(warehouse) if warehouse else None
+        inv_wid = str(wid) if wid else SELLER_WAREHOUSE_ID
+
+        if inv_wid and chrt_id:
+            sm = mp_get_inventory_map(inv_wid, [chrt_id])
+            if chrt_id in sm:
+                ostatok_line = f"Остаток: {sm[chrt_id]} шт"
+    # fallback: если это реально FBW/FBO (WB-склад)
+    if ostatok_line.endswith("-"):
         q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
         if isinstance(q, int):
             ostatok_line = f"Остаток: {q} шт"
 
-    # Тип события по статистике
-is_cancel = bool(o.get("isCancel") or o.get("isCanceled") or o.get("cancel") or False)
-cancel_date = _safe_str(o.get("cancelDate") or o.get("canceledAt") or o.get("cancelDt") or "")
     if is_cancel:
-    header = f"❌ Отмена заказа · {SHOP_NAME}"
+        header = f"❌ Отмена заказа · {SHOP_NAME}"
     else:
-    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
+        header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
 
-    cancel_line = f"Дата отмены: {cancel_date}" if is_cancel and cancel_date else ""
-body = (
-    f"📦 Склад отгрузки: {warehouse}"
-    f"{cancel_line}"
-    f"• {product_name}"
-    f"  Артикул WB: {nm_id or '-'}"
-    f"  — {qty} шт • Покупка на сумму - {_rub(price)}"
-    f"{ostatok_line}"
-    f"Итого позиций: {qty}"
-    f"Сумма: {_rub(price)}"
-)
-
-    return f"{header}\n{body}".strip()
-
-
-# -------------------------
-# Questions (Q&A)
-# -------------------------
-def questions_fetch(is_answered: bool) -> List[Dict[str, Any]]:
-    if not WB_FEEDBACKS_TOKEN:
-        return []
-
-    url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
-    data = wb_get(
-        url,
-        WB_FEEDBACKS_TOKEN,
-        params={
-            "isAnswered": "true" if is_answered else "false",
-            "take": 100,
-            "skip": 0
-        },
+    body = (
+        f"📦 Склад: {warehouse}\n"
+        + (f"Тип склада: {warehouse_type}\n" if warehouse_type else "")
+        + f"• {product_name}\n"
+        + f"  Артикул WB: {nm_id or '-'}\n"
+        + f"  — {qty} шт • Сумма: {_rub(price)}\n"
+        + f"{ostatok_line}\n"
+        + f"Дата: {created}"
+        + (f"\nОтменён: {cancel_dt}" if cancel_dt else "")
     )
 
-    if isinstance(data, dict) and data.get("__error__"):
-        return [{"__error__": True, **data, "__stage__": f"questions isAnswered={is_answered}"}]
-
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        qs = data["data"].get("questions", [])
-        if isinstance(qs, list):
-            return [q for q in qs if isinstance(q, dict)]
-
-    return []
+    return f"{header}\n{body}".strip()
 
 def format_question(q: Dict[str, Any]) -> str:
     qid = _safe_str(q.get("id"))
@@ -1157,16 +1130,20 @@ def format_sale_event(s: Dict[str, Any]) -> str:
     except Exception:
         price_f = 0.0
 
+    sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
+    is_return = (price_f < 0) or sale_id.upper().startswith("R")
+
     created = _format_dt_ru(_safe_str(s.get("date") or s.get("lastChangeDate") or ""))
 
-    kind = "✅ Выкуп" if price_f >= 0 else "↩️ Возврат/отказ"
+    kind = "✅ Выкуп" if not is_return else "↩️ Возврат/отказ"
     return (
         f"{kind} · {SHOP_NAME}\n"
         f"Склад: {warehouse}\n"
         f"Товар: {name}\n"
         f"Артикул WB: {nm_id or '-'}\n"
         f"Сумма: {_rub(abs(price_f))}\n"
-        f"Дата: {created}"
+        + (f"ID: {sale_id}\n" if sale_id else "")
+        + f"Дата: {created}"
     ).strip()
 
 async def poll_sales_loop():
@@ -1218,36 +1195,40 @@ def _price_from_row(row: Dict[str, Any]) -> float:
     return 0.0
 
 def daily_summary_text(today: datetime) -> str:
+    """
+    Сводка за день (по МСК):
+      - "Продано" = оформленные заказы из statistics /supplier/orders (flag=1, dateFrom=YYYY-MM-DD)
+      - "Выкуплено" = выкупы из statistics /supplier/sales (flag=1) без возвратов
+      - "Отмен/отказов" = отмены из orders (isCancel=true) + возвраты из sales
+    Примечание: WB прямо пишет, что отчёты обновляются каждые ~30 минут и данные предварительные.
+    """
     if not WB_STATS_TOKEN:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
 
-    # 1) Оформленные заказы — statistics supplier/orders
     orders_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str})
+    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
 
-    sold_cnt = 0
-    sold_sum = 0.0
-    cancel_cnt = 0
-    cancel_sum = 0.0
+    orders_cnt = 0
+    orders_sum = 0.0
+    cancels_cnt = 0
+    cancels_sum = 0.0
 
     if isinstance(orders, list):
         for o in orders:
             if not isinstance(o, dict):
                 continue
             p = max(0.0, _price_from_row(o))
-            is_cancel = bool(o.get("isCancel") or o.get("isCanceled") or o.get("cancel") or False)
-            if is_cancel:
-                cancel_cnt += 1
-                cancel_sum += p
+            if bool(o.get("isCancel")):
+                cancels_cnt += 1
+                cancels_sum += p
             else:
-                sold_cnt += 1
-                sold_sum += p
+                orders_cnt += 1
+                orders_sum += p
     elif isinstance(orders, dict) and orders.get("__error__") and orders.get("status_code") not in (429, 502, 503, 504):
         return f"⚠️ Суточная сводка: ошибка statistics orders {orders.get('status_code')} · {SHOP_NAME}"
 
-    # 2) Выкупы/возвраты — statistics supplier/sales?flag=1
     sales_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
     sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
 
@@ -1262,7 +1243,7 @@ def daily_summary_text(today: datetime) -> str:
                 continue
             p = _price_from_row(s)
             sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
-            is_return = (p < 0) or (sale_id.upper().startswith("R"))
+            is_return = (p < 0) or sale_id.upper().startswith("R")
             if is_return:
                 returns_cnt += 1
                 returns_sum += abs(p)
@@ -1272,42 +1253,28 @@ def daily_summary_text(today: datetime) -> str:
     elif isinstance(sales, dict) and sales.get("__error__") and sales.get("status_code") not in (429, 502, 503, 504):
         return f"⚠️ Суточная сводка: ошибка statistics sales {sales.get('status_code')} · {SHOP_NAME}"
 
-    return f"""📊 Итог дня за {day_str} (МСК) · {SHOP_NAME}
-🛒 Товаров продано на сумму: {_rub(sold_sum)} · {sold_cnt} шт
-✅ Выкуп товаров произведен на сумму: {_rub(buyouts_sum)} · {buyouts_cnt} шт
-❌ Отмены: {_rub(cancel_sum)} · {cancel_cnt} шт
-↩️ Отказы/возвраты: {_rub(returns_sum)} · {returns_cnt} шт""".strip()
+    # Формат максимально близко к твоему:
+    # "товаров продано на сумму" = сумма оформленных (не отменённых) заказов
+    # "выкуп товаров произведен на сумму" = сумма выкупов без возвратов
+    txt = f"""📊 Итог дня · {SHOP_NAME}
+Дата (МСК): {day_str}
 
+🛒 Товаров продано (оформлено заказов): {orders_cnt} шт
+На сумму: {_rub(orders_sum)}
 
+✅ Выкуп товаров произведён: {buyouts_cnt} шт
+На сумму: {_rub(buyouts_sum)}"""
 
-# -------------------------
-# Poll loops
-# -------------------------
-async def poll_marketplace_loop():
-    while True:
-        try:
-            orders = mp_fetch_new_orders()
-            for kind, o in orders:
-                if DEBUG_RAW_ORDERS:
-                    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
-                    if not was_sent(debug_key):
-                        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
-                        mark_sent(debug_key)
+    # по желанию — добавляем отдельно отмены/отказы
+    txt += f"""
 
-                key = f"mp:{kind}:{o.get('_id','')}"
-                if was_sent(key):
-                    continue
+❌ Отменено заказов: {cancels_cnt} шт
+На сумму: {_rub(cancels_sum)}
 
-                res = tg_send(format_mp_order(kind, o))
-                if res.get("ok"):
-                    mark_sent(key)
-        except Exception as e:
-            ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
-            if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
-                mark_sent(ek)
+↩️ Возвраты/отказы (по продажам): {returns_cnt} шт
+На сумму: {_rub(returns_sum)}"""
 
-        await asyncio.sleep(POLL_FBS_SECONDS)
+    return txt.strip()
 
 async def poll_fbw_loop():
     while True:
