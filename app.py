@@ -925,22 +925,16 @@ if is_cancel:
 else:
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
 
-    cancel_line = f"Дата отмены: {cancel_date}
-" if is_cancel and cancel_date else ""
+    cancel_line = f"Дата отмены: {cancel_date}" 
+if is_cancel and cancel_date else ""
 body = (
-    f"📦 Склад отгрузки: {warehouse}
-"
+    f"📦 Склад отгрузки: {warehouse}"
     f"{cancel_line}"
-    f"• {product_name}
-"
-    f"  Артикул WB: {nm_id or '-'}
-"
-    f"  — {qty} шт • Покупка на сумму - {_rub(price)}
-"
-    f"{ostatok_line}
-"
-    f"Итого позиций: {qty}
-"
+    f"• {product_name}"
+    f"  Артикул WB: {nm_id or '-'}"
+    f"  — {qty} шт • Покупка на сумму - {_rub(price)}"
+    f"{ostatok_line}"
+    f"Итого позиций: {qty}"
     f"Сумма: {_rub(price)}"
 )
 
