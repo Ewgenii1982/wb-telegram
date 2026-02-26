@@ -920,13 +920,12 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     # Тип события по статистике
 is_cancel = bool(o.get("isCancel") or o.get("isCanceled") or o.get("cancel") or False)
 cancel_date = _safe_str(o.get("cancelDate") or o.get("canceledAt") or o.get("cancelDt") or "")
-if is_cancel:
+    if is_cancel:
     header = f"❌ Отмена заказа · {SHOP_NAME}"
-else:
+    else:
     header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
 
-    cancel_line = f"Дата отмены: {cancel_date}" 
-if is_cancel and cancel_date else ""
+    cancel_line = f"Дата отмены: {cancel_date}" if is_cancel and cancel_date else ""
 body = (
     f"📦 Склад отгрузки: {warehouse}"
     f"{cancel_line}"
