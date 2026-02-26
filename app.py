@@ -1065,10 +1065,13 @@ async def poll_sales_loop():
                 if int(rows[0].get("status_code") or 0) == 429:
                     pass
                 else:
-                    ek = f"err:stats_sales:{rows[0].get('status_code')}:{rows[0].get('url','')}"
-                    if not was_sent(ek):
-                        tg_send(f"⚠️ statistics sales error: {rows[0].get('status_code')} {rows[0].get('response_text','')[:300]}")
-                        mark_sent(ek)
+                    status = rows[0].get('status_code')
+                    # 429/502/503/504 — это временные сбои/лимиты, не спамим в TG
+                    if status not in (429, 502, 503, 504):
+                        ek = f"err:stats_sales:{status}:{rows[0].get('url','')}"
+                        if not was_sent(ek):
+                            tg_send(f"⚠️ statistics sales error: {status} {rows[0].get('response_text','')[:300]}")
+                            mark_sent(ek)
             else:
                 for s in rows:
                     if not isinstance(s, dict):
@@ -1090,126 +1093,70 @@ async def poll_sales_loop():
 
 
 # -------------------------
-# Daily summary (заказы + выкупы + возвраты)
+# Daily summary (orders + buyouts + returns)
 # -------------------------
-def _sum_orders_for_day(day_msk: datetime) -> Tuple[int, float]:
-    """
-    'Продажи' как 'заказы' из supplier/orders за сутки (МСК).
-    """
-    if not WB_STATS_TOKEN:
-        return (0, 0.0)
-
-    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    day_start = day_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": iso_msk(day_start)})
-
-    if not isinstance(data, list):
-        return (0, 0.0)
-
-    cnt = 0
-    sm = 0.0
-    for o in data:
-        if not isinstance(o, dict):
-            continue
-        # ограничим только этой датой (на всякий)
-        d = _safe_str(o.get("date") or o.get("lastChangeDate") or "")
-        if d and not d.startswith(day_start.strftime("%Y-%m-%d")):
-            continue
-
-        price = (
-            o.get("priceWithDisc")
-            or o.get("finishedPrice")
-            or o.get("forPay")
-            or o.get("totalPrice")
-            or o.get("price")
-            or 0
-        )
-        try:
-            price_f = float(price)
-        except Exception:
-            price_f = 0.0
-
-        qty = o.get("quantity") or o.get("qty") or 1
-        try:
-            qty_i = int(qty)
-        except Exception:
-            qty_i = 1
-        if qty_i <= 0:
-            qty_i = 1
-
-        cnt += qty_i
-        if price_f > 0:
-            sm += price_f * qty_i
-
-    return (cnt, sm)
+def _price_from_row(row: Dict[str, Any]) -> float:
+    for k in ("forPay", "priceWithDisc", "finishedPrice", "totalPrice", "price"):
+        if row.get(k) is not None:
+            try:
+                return float(row.get(k))
+            except Exception:
+                continue
+    return 0.0
 
 def daily_summary_text(today: datetime) -> str:
     if not WB_STATS_TOKEN:
-        return f"📊 Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
+        return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
-    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
-    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
 
-    # 429 — лимит. Не спамим ошибкой, просто скажем что данных нет.
-    if isinstance(data, dict) and data.get("__error__"):
-        if int(data.get("status_code") or 0) == 429:
-            return (
-                f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}"
-                f"Продажи: нет данных (лимит API)"
-                f"Выкупы: нет данных (лимит API)"
-                f"Возвраты/отказы: нет данных (лимит API)"
-                f"Отзывы: см. уведомления (если были — ты их получил)"
-            ).strip()
-        return f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME} Данные временно недоступны."
+    # 1) Заказы (продажи в смысле "оформлено заказов") — supplier/orders
+    orders_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
+    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str})
+    orders_cnt = 0
+    orders_sum = 0.0
+    if isinstance(orders, list):
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            orders_cnt += 1
+            orders_sum += max(0.0, _price_from_row(o))
+    elif isinstance(orders, dict) and orders.get("__error__") and orders.get("status_code") not in (429, 502, 503, 504):
+        return f"⚠️ Суточная сводка: ошибка statistics orders {orders.get('status_code')} · {SHOP_NAME}"
 
-    if not isinstance(data, list):
-        return f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME} Нет данных."
+    # 2) Выкупы + возвраты — supplier/sales?flag=1
+    sales_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
+    sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
 
-    sales_cnt = 0
-    sales_sum = 0.0
-
-    buyout_cnt = 0
-    buyout_sum = 0.0
-
+    buyouts_cnt = 0
+    buyouts_sum = 0.0
     returns_cnt = 0
     returns_sum = 0.0
 
-    for row in data:
-        if not isinstance(row, dict):
-            continue
+    if isinstance(sales, list):
+        for s in sales:
+            if not isinstance(s, dict):
+                continue
+            p = _price_from_row(s)
+            sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
+            is_return = (p < 0) or (sale_id.upper().startswith("R"))
+            if is_return:
+                returns_cnt += 1
+                returns_sum += abs(p)
+            else:
+                buyouts_cnt += 1
+                buyouts_sum += max(0.0, p)
+    elif isinstance(sales, dict) and sales.get("__error__") and sales.get("status_code") not in (429, 502, 503, 504):
+        return f"⚠️ Суточная сводка: ошибка statistics sales {sales.get('status_code')} · {SHOP_NAME}"
 
-        price = row.get("forPay") or row.get("priceWithDisc") or row.get("finishedPrice") or 0
-        try:
-            price_f = float(price)
-        except Exception:
-            price_f = 0.0
-
-        # отрицательные — возвраты/отказы
-        if price_f < 0:
-            returns_cnt += 1
-            returns_sum += abs(price_f)
-            continue
-
-        # разделяем «продажи» и «выкупы» по признаку saleID
-        sale_id = _safe_str(row.get("saleID") or row.get("saleId") or "")
-        if sale_id:
-            buyout_cnt += 1
-            buyout_sum += price_f
-        else:
-            sales_cnt += 1
-            sales_sum += price_f
-
-    return (
-        f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}"
-        f"🛒 Продажи позиций: {sales_cnt}"
-        f"Сумма продаж: {_rub(sales_sum)}"
-        f"✅ Выкупы позиций: {buyout_cnt}"
-        f"Сумма выкупов: {_rub(buyout_sum)}"
-        f"↩️ Отказы/возвраты позиций: {returns_cnt}"
-        f"Сумма отказов/возвратов: {_rub(returns_sum)}"
-        f"Отзывы: см. уведомления (если были — ты их получил)"
-    ).strip()
+    return f"""📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}
+🧾 Заказы (оформлено): {orders_cnt}
+Сумма заказов: {_rub(orders_sum)}
+✅ Выкупы: {buyouts_cnt}
+Товаров выкуплено на сумму: {_rub(buyouts_sum)}
+↩️ Отказы/возвраты: {returns_cnt}
+Сумма отказов/возвратов: {_rub(returns_sum)}
+Отзывы/вопросы: см. уведомления (если были — ты их получил)""".strip()
 
 
 # -------------------------
