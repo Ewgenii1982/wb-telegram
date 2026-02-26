@@ -4,6 +4,7 @@ import json
 import time
 import asyncio
 import sqlite3
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,7 +21,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()               # marketplace-api (FBS/DBS/DBW)
 WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()         # statistics-api (FBW)
-WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip() # feedbacks-api (reviews)
+WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip() # feedbacks-api (reviews + questions)
 WB_WEBHOOK_SECRET = os.getenv("WB_WEBHOOK_SECRET", "").strip()
 
 WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()     # Content API (title, sizes)
@@ -32,6 +33,9 @@ POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "20"))
 POLL_FEEDBACKS_SECONDS = int(os.getenv("POLL_FEEDBACKS_SECONDS", "60"))
 POLL_QUESTIONS_SECONDS = int(os.getenv("POLL_QUESTIONS_SECONDS", "60"))
 POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "1800"))
+
+# polling выкупов/продаж (statistics/sales)
+POLL_SALES_SECONDS = int(os.getenv("POLL_SALES_SECONDS", "120"))
 
 DAILY_SUMMARY_HOUR_MSK = int(os.getenv("DAILY_SUMMARY_HOUR_MSK", "23"))
 DAILY_SUMMARY_MINUTE_MSK = int(os.getenv("DAILY_SUMMARY_MINUTE_MSK", "55"))
@@ -57,41 +61,69 @@ WB_CONTENT_BASE = "https://content-api.wildberries.ru"
 def _safe_str(x) -> str:
     return "" if x is None else str(x).strip()
 
+def _looks_like_mojibake(s: str) -> bool:
+    # типичный мусор "Р°", "СЃ" и т.п.
+    if not s:
+        return False
+    if ("Р" not in s) and ("С" not in s):
+        return False
+    # если есть много последовательностей вида "Р°" / "СЃ" и т.п. — почти наверняка кракозябра
+    return bool(re.search(r"(Р[а-яА-ЯёЁ]|С[а-яА-ЯёЁ]|Р[^\s]|С[^\s])", s))
+
 def fix_mojibake(s: str) -> str:
+    """
+    Лечит типичные кракозябры WB вида "Р°С..." (когда UTF-8 текст был неверно интерпретирован).
+    ВАЖНО: не ломает нормальный русский текст (пробелы не вырезаем без необходимости).
+    """
     s = _safe_str(s)
     if not s:
         return ""
 
-    # если нет типичных маркеров — не трогаем
-    if ("Р" not in s) and ("С" not in s):
+    if not _looks_like_mojibake(s):
         return s
 
-    # 1) Частый случай: UTF-8 байты прочитали как latin1 (получили "Р°...")
+    candidates: List[str] = []
+
+    # вариант А: UTF-8 байты прочитали как latin1
     try:
-        b = s.encode("latin1", errors="strict")
-        # лечим вариант "Р Р°..." — когда между байтами затесались пробелы/NBSP
-        b = b.replace(b"\xC2\xA0", b"")  # UTF-8 NBSP последовательность
-        b = b.replace(b"\xA0", b"")      # NBSP одиночный
-        b = b.replace(b" ", b"")         # пробелы между байтами
-        t = b.decode("utf-8", errors="strict")
-        if t and ("Р" not in t) and ("С" not in t):
-            return t
-        return t  # даже если остались Р/С — иногда это уже нормальный русский (редко), но пусть
+        candidates.append(s.encode("latin1", errors="strict").decode("utf-8", errors="strict"))
     except Exception:
         pass
 
-    # 2) Запасной вариант: UTF-8 байты прочитали как cp1251
+    # вариант Б: UTF-8 байты прочитали как cp1251
     try:
-        b = s.encode("cp1251", errors="strict")
-        b = b.replace(b"\xA0", b"").replace(b" ", b"")
-        t = b.decode("utf-8", errors="strict")
-        if t:
-            return t
+        candidates.append(s.encode("cp1251", errors="strict").decode("utf-8", errors="strict"))
     except Exception:
         pass
 
-    return s
-    
+    # вариант В: иногда прилетают строки "Р Р°С ..." (с мусорными пробелами/nbsp).
+    # Убираем ТОЛЬКО если видно что пробелов слишком много и это именно кракозябра.
+    if s.count(" ") > max(2, len(s) // 6) or "\u00A0" in s:
+        compact = s.replace("\u00A0", "").replace(" ", "")
+        if compact != s and _looks_like_mojibake(compact):
+            try:
+                candidates.append(compact.encode("latin1", errors="strict").decode("utf-8", errors="strict"))
+            except Exception:
+                pass
+            try:
+                candidates.append(compact.encode("cp1251", errors="strict").decode("utf-8", errors="strict"))
+            except Exception:
+                pass
+
+    # выбираем “лучшего”: меньше 'Р'/'С' и нет �
+    def score(t: str) -> Tuple[int, int, int]:
+        return (t.count("�"), t.count("Р") + t.count("С"), -sum(1 for ch in t if "А" <= ch <= "я" or ch in "Ёё"))
+
+    best = None
+    for t in candidates:
+        t = _safe_str(t)
+        if not t:
+            continue
+        if best is None or score(t) < score(best):
+            best = t
+
+    return best if best is not None else s
+
 def _rub(x) -> str:
     try:
         v = float(x)
@@ -124,6 +156,7 @@ def tg_word_stars(n: int) -> str:
     if 2 <= last <= 4:
         return "звезды"
     return "звёзд"
+
 
 # -------------------------
 # Helpers: DB (dedup + cursors)
@@ -206,33 +239,50 @@ def tg_send(text: str) -> Dict[str, Any]:
 # -------------------------
 def _decode_json_from_response(r: requests.Response) -> Any:
     raw = r.content or b""
-
-    # WB обычно UTF-8
     for enc in ("utf-8", "cp1251"):
         try:
             return json.loads(raw.decode(enc))
         except Exception:
             pass
-
     try:
         return r.json()
     except Exception:
         return (raw.decode("utf-8", errors="replace") or r.text)
 
-def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
-    headers = {"Authorization": token}
+def _wb_request_with_429_retry(method: str, url: str, headers: dict, *, params=None, json_payload=None, timeout: int = 25) -> requests.Response:
+    r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
 
-    r = requests.get(url, headers=headers, params=params, timeout=timeout)
-
-    # ✅ обработка лимита
+    # 429 — лимит. WB отдаёт X-Ratelimit-Retry (секунды)
     if r.status_code == 429:
         retry = r.headers.get("X-Ratelimit-Retry")
         try:
             wait_s = int(float(retry)) if retry is not None else 2
         except Exception:
             wait_s = 2
-        time.sleep(max(1, min(wait_s, 30)))  # не спим бесконечно
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        time.sleep(max(1, min(wait_s, 30)))
+        r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
+
+    return r
+
+def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
+    headers = {"Authorization": token}
+    r = _wb_request_with_429_retry("GET", url, headers, params=params, timeout=timeout)
+
+    if r.status_code >= 400:
+        return {
+            "__error__": True,
+            "status_code": r.status_code,
+            "url": r.url,
+            "response_text": r.text,
+            "ratelimit_retry": r.headers.get("X-Ratelimit-Retry"),
+            "ratelimit_reset": r.headers.get("X-Ratelimit-Reset"),
+        }
+
+    return _decode_json_from_response(r)
+
+def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
+    headers = {"Authorization": token}
+    r = _wb_request_with_429_retry("POST", url, headers, json_payload=payload, timeout=timeout)
 
     if r.status_code >= 400:
         return {
@@ -285,7 +335,6 @@ def content_get_title(nm_id: Optional[int] = None, vendor_code: str = "") -> str
     if not isinstance(cards, list) or not cards:
         return ""
 
-    # лучше точное совпадение nmID
     if nm_id:
         for c in cards:
             if isinstance(c, dict) and str(c.get("nmID")) == str(nm_id):
@@ -435,17 +484,11 @@ def stats_fetch_fbw_stocks() -> List[Dict[str, Any]]:
     if not isinstance(data, list):
         return []
 
-    # сразу фикс текста в кеше, чтобы сравнения работали стабильно
     for r in data:
         if isinstance(r, dict):
-            if "warehouseName" in r:
-                r["warehouseName"] = fix_mojibake(_safe_str(r.get("warehouseName")))
-            if "supplierArticle" in r:
-                r["supplierArticle"] = fix_mojibake(_safe_str(r.get("supplierArticle")))
-            if "category" in r:
-                r["category"] = fix_mojibake(_safe_str(r.get("category")))
-            if "subject" in r:
-                r["subject"] = fix_mojibake(_safe_str(r.get("subject")))
+            for k in ("warehouseName", "supplierArticle", "category", "subject", "nmName"):
+                if k in r:
+                    r[k] = fix_mojibake(_safe_str(r.get(k)))
 
     _FBW_STOCKS_CACHE = (now, data)
     return data
@@ -591,7 +634,6 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
 
     items = _extract_items_from_mp_order(o)
 
-    # остатки по seller warehouse (если задан)
     chrt_ids: List[int] = []
     for it in items:
         cid = it.get("chrtId") or it.get("chrtID")
@@ -614,7 +656,6 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         vendor_code = fix_mojibake(_safe_str(it.get("supplierArticle") or it.get("vendorCode") or it.get("article") or ""))
         product_name = pick_best_name_from_order(it)
 
-        # nmId (если есть) и title через Content API (если WB прислал только категорию/кратко)
         nm_id_raw = it.get("nmId") or it.get("nmID")
         nm_id: Optional[int] = None
         if nm_id_raw is not None:
@@ -627,10 +668,8 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         if nm_id:
             full_title = content_get_title(nm_id=nm_id, vendor_code=vendor_code)
             if full_title:
-                # всегда можно улучшать до полного названия
                 product_name = full_title
         elif subject and product_name == subject:
-            # запасной путь, если nm_id нет
             full_title = content_get_title(nm_id=None, vendor_code=vendor_code)
             if full_title:
                 product_name = full_title
@@ -715,19 +754,11 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
     if isinstance(last, dict) and last.get("lastChangeDate"):
         set_cursor(cursor_name, last["lastChangeDate"])
 
-    # фикс текста сразу
     for r in data:
         if isinstance(r, dict):
-            if "warehouseName" in r:
-                r["warehouseName"] = fix_mojibake(_safe_str(r.get("warehouseName")))
-            if "supplierArticle" in r:
-                r["supplierArticle"] = fix_mojibake(_safe_str(r.get("supplierArticle")))
-            if "subject" in r:
-                r["subject"] = fix_mojibake(_safe_str(r.get("subject")))
-            if "nmName" in r:
-                r["nmName"] = fix_mojibake(_safe_str(r.get("nmName")))
-            if "category" in r:
-                r["category"] = fix_mojibake(_safe_str(r.get("category")))
+            for k in ("warehouseName", "supplierArticle", "subject", "nmName", "category"):
+                if k in r:
+                    r[k] = fix_mojibake(_safe_str(r.get(k)))
 
     return data
 
@@ -738,14 +769,13 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     nm_id: Optional[int] = None
     if nm_id_raw is not None:
         try:
-            nm_id = int(float(nm_id_raw))  # иногда "537328918.0"
+            nm_id = int(float(nm_id_raw))
         except Exception:
             nm_id = None
 
     barcode = _safe_str(o.get("barcode") or o.get("barCode") or "")
     supplier_article = fix_mojibake(_safe_str(o.get("supplierArticle") or o.get("vendorCode") or o.get("article") or ""))
 
-    # Базовое имя из statistics
     product_name = fix_mojibake(_safe_str(
         o.get("nmName")
         or o.get("productName")
@@ -754,7 +784,6 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or "Товар"
     ))
 
-    # ✅ Всегда пытаемся улучшить до полного title по nmId
     if nm_id:
         full_title = content_get_title(nm_id=nm_id, vendor_code=supplier_article)
         if full_title:
@@ -777,7 +806,6 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or 0
     )
 
-    # 🔥 FBW остаток (как в разделе "Товары")
     ostatok_line = "Остаток: -"
     q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
     if isinstance(q, int):
@@ -796,6 +824,7 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     )
 
     return f"{header}\n{body}".strip()
+
 
 # -------------------------
 # Questions (Q&A)
@@ -818,7 +847,6 @@ def questions_fetch(is_answered: bool) -> List[Dict[str, Any]]:
     if isinstance(data, dict) and data.get("__error__"):
         return [{"__error__": True, **data, "__stage__": f"questions isAnswered={is_answered}"}]
 
-    # формат WB: {"data": {...}, "error": false}
     if isinstance(data, dict) and isinstance(data.get("data"), dict):
         qs = data["data"].get("questions", [])
         if isinstance(qs, list):
@@ -842,7 +870,6 @@ def format_question(q: Dict[str, Any]) -> str:
     product_name = fix_mojibake(_safe_str(pd.get("productName") or "Товар"))
     supplier_article = fix_mojibake(_safe_str(pd.get("supplierArticle") or ""))
 
-    # улучшаем до полного title, если можем
     if nm_id:
         full_title = content_get_title(nm_id=nm_id, vendor_code=supplier_article)
         if full_title:
@@ -861,10 +888,8 @@ def format_question(q: Dict[str, Any]) -> str:
 async def poll_questions_loop():
     while True:
         try:
-            # важнее всего — НЕотвеченные
             items = questions_fetch(is_answered=False)
 
-            # если WB вернул ошибку — уведомим один раз
             if items and isinstance(items[0], dict) and items[0].get("__error__"):
                 it = items[0]
                 ek = f"err:questions:{it.get('status_code')}:{it.get('__stage__','')}"
@@ -890,6 +915,7 @@ async def poll_questions_loop():
                 mark_sent(ek)
 
         await asyncio.sleep(POLL_QUESTIONS_SECONDS)
+
 
 # -------------------------
 # Feedbacks
@@ -959,6 +985,11 @@ def prime_feedbacks_silently() -> None:
                 mark_sent(f"feedback:{fid}")
     except Exception:
         pass
+
+
+# -------------------------
+# Statistics: sales (выкупы/возвраты) polling
+# -------------------------
 def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
     if not WB_STATS_TOKEN:
         return []
@@ -974,12 +1005,10 @@ def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
     if not isinstance(data, list) or not data:
         return []
 
-    # сдвигаем курсор по lastChangeDate (если есть)
     last = data[-1]
     if isinstance(last, dict) and last.get("lastChangeDate"):
         set_cursor(cursor_name, last["lastChangeDate"])
 
-    # фиксим текст
     for r in data:
         if isinstance(r, dict):
             for k in ("warehouseName", "supplierArticle", "subject", "nmName", "category"):
@@ -989,8 +1018,8 @@ def stats_fetch_sales_since(cursor_name: str) -> List[Dict[str, Any]]:
     return data
 
 def format_sale_event(s: Dict[str, Any]) -> str:
-    # saleID есть у продажи/выкупа; у возврата обычно будет отрицательная/иная логика, но WB путает — покажем по знаку forPay
     warehouse = fix_mojibake(_safe_str(s.get("warehouseName") or "WB"))
+
     nm_id = None
     for k in ("nmId", "nmID", "nm_id"):
         if s.get(k) is not None:
@@ -1040,7 +1069,6 @@ async def poll_sales_loop():
                     if not isinstance(s, dict):
                         continue
                     sid = _safe_str(s.get("saleID") or s.get("saleId") or "")
-                    # если saleID пустой — всё равно можем дедупить по составному ключу
                     key = f"sale:{sid}:{_safe_str(s.get('lastChangeDate'))}:{_safe_str(s.get('srid'))}:{_safe_str(s.get('barcode'))}"
                     if was_sent(key):
                         continue
@@ -1053,17 +1081,73 @@ async def poll_sales_loop():
                 tg_send(f"⚠️ Ошибка sales polling: {e}")
                 mark_sent(ek)
 
-        await asyncio.sleep(120)
+        await asyncio.sleep(POLL_SALES_SECONDS)
 
 
 # -------------------------
-# Daily summary (sales + returns)
+# Daily summary (заказы + выкупы + возвраты)
 # -------------------------
+def _sum_orders_for_day(day_msk: datetime) -> Tuple[int, float]:
+    """
+    'Продажи' как 'заказы' из supplier/orders за сутки (МСК).
+    """
+    if not WB_STATS_TOKEN:
+        return (0, 0.0)
+
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
+    day_start = day_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": iso_msk(day_start)})
+
+    if not isinstance(data, list):
+        return (0, 0.0)
+
+    cnt = 0
+    sm = 0.0
+    for o in data:
+        if not isinstance(o, dict):
+            continue
+        # ограничим только этой датой (на всякий)
+        d = _safe_str(o.get("date") or o.get("lastChangeDate") or "")
+        if d and not d.startswith(day_start.strftime("%Y-%m-%d")):
+            continue
+
+        price = (
+            o.get("priceWithDisc")
+            or o.get("finishedPrice")
+            or o.get("forPay")
+            or o.get("totalPrice")
+            or o.get("price")
+            or 0
+        )
+        try:
+            price_f = float(price)
+        except Exception:
+            price_f = 0.0
+
+        qty = o.get("quantity") or o.get("qty") or 1
+        try:
+            qty_i = int(qty)
+        except Exception:
+            qty_i = 1
+        if qty_i <= 0:
+            qty_i = 1
+
+        cnt += qty_i
+        if price_f > 0:
+            sm += price_f * qty_i
+
+    return (cnt, sm)
+
 def daily_summary_text(today: datetime) -> str:
     if not WB_STATS_TOKEN:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
+
+    # 1) "Продажи" = заказы
+    orders_cnt, orders_sum = _sum_orders_for_day(today)
+
+    # 2) "Выкупы/возвраты" = supplier/sales
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
     data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
     if isinstance(data, dict) and data.get("__error__"):
@@ -1072,9 +1156,9 @@ def daily_summary_text(today: datetime) -> str:
     if not isinstance(data, list):
         return f"⚠️ Суточная сводка: нет данных · {SHOP_NAME}"
 
-    sold_sum = 0.0
+    buyout_sum = 0.0
+    buyout_cnt = 0
     returns_sum = 0.0
-    sold_cnt = 0
     returns_cnt = 0
 
     for row in data:
@@ -1083,23 +1167,26 @@ def daily_summary_text(today: datetime) -> str:
 
         price = row.get("forPay") or row.get("priceWithDisc") or row.get("finishedPrice") or 0
         try:
-            price = float(price)
+            price_f = float(price)
         except Exception:
-            price = 0.0
+            price_f = 0.0
 
-        if row.get("saleID") is not None and price >= 0:
-            sold_cnt += 1
-            sold_sum += price
+        # логика: forPay >= 0 => выкуп, иначе возврат/отказ
+        if price_f >= 0:
+            buyout_cnt += 1
+            buyout_sum += price_f
         else:
             returns_cnt += 1
-            returns_sum += abs(price)
+            returns_sum += abs(price_f)
 
     return (
         f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}\n"
-        f"Продано позиций: {sold_cnt}\n"
-        f"Сумма продаж/выкупа: {sold_sum:.2f}\n"
-        f"Отказы/возвраты позиций: {returns_cnt}\n"
-        f"Сумма отказов/возвратов: {returns_sum:.2f}\n"
+        f"🧾 Продажи (заказы): {orders_cnt}\n"
+        f"Сумма заказов: {_rub(orders_sum)}\n"
+        f"✅ Выкупы: {buyout_cnt}\n"
+        f"Сумма выкупов: {_rub(buyout_sum)}\n"
+        f"↩️ Отказы/возвраты: {returns_cnt}\n"
+        f"Сумма отказов/возвратов: {_rub(returns_sum)}\n"
         f"Отзывы: см. уведомления (если были — ты их получил)"
     ).strip()
 
@@ -1267,7 +1354,6 @@ def ping_content():
 
 @app.get("/test-title/{nm_id}")
 def test_title(nm_id: int):
-    # тут вернём уже “вылеченный” title, чтобы не бесило
     return {"nm_id": nm_id, "title": content_get_title(nm_id=nm_id, vendor_code="")}
 
 @app.get("/mp-warehouses")
@@ -1298,8 +1384,6 @@ def test_questions():
         return {"ok": False, "error": "no WB_FEEDBACKS_TOKEN"}
 
     url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
-
-    # WB требует isAnswered, обычно "true"/"false"
     out = {
         "isAnswered=false": wb_get(url, WB_FEEDBACKS_TOKEN, params={"isAnswered": "false", "take": 20, "skip": 0}),
         "isAnswered=true": wb_get(url, WB_FEEDBACKS_TOKEN, params={"isAnswered": "true", "take": 20, "skip": 0}),
@@ -1315,10 +1399,8 @@ def debug_title(nm_id: int):
         "fixed": fix_mojibake(raw),
         "raw_repr": repr(raw),
     }
-@app.get("/debug-title/{nm_id}")
-def debug_title(nm_id: int):
-    raw = content_get_title(nm_id=nm_id, vendor_code="")
-    return {"nm_id": nm_id, "raw": raw, "fixed": fix_mojibake(raw), "raw_repr": repr(raw)}
+
+
 # -------------------------
 # Startup
 # -------------------------
@@ -1335,4 +1417,4 @@ async def startup():
     asyncio.create_task(poll_questions_loop())
 
     if not DISABLE_STARTUP_HELLO:
-        tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой) и отзывы.")
+        tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой), выкупы и отзывы/вопросы.")
