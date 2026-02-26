@@ -418,69 +418,6 @@ def content_get_sizes(nm_id: int) -> List[Dict[str, Any]]:
 _STOCKS_CACHE: Dict[str, Tuple[float, Dict[int, int]]] = {}
 _STOCKS_CACHE_TTL = 30
 
-# -------------------------
-# Marketplace: seller warehouses (id -> name/address) cache
-# -------------------------
-_WAREHOUSES_CACHE: Tuple[float, Dict[int, Dict[str, str]]] = (0.0, {})
-_WAREHOUSES_TTL = 300
-
-def mp_get_seller_warehouses() -> Dict[int, Dict[str, str]]:
-    """Returns mapping: warehouseId -> {name, address}."""
-    global _WAREHOUSES_CACHE
-    if not WB_MP_TOKEN:
-        return {}
-
-    now = time.time()
-    ts, cached = _WAREHOUSES_CACHE
-    if cached and (now - ts) <= _WAREHOUSES_TTL:
-        return cached
-
-    url = f"{WB_MARKETPLACE_BASE}/api/v3/warehouses"
-    data = wb_get(url, WB_MP_TOKEN)
-    if isinstance(data, dict) and data.get("__error__"):
-        return cached or {}
-
-    out: Dict[int, Dict[str, str]] = {}
-    if isinstance(data, list):
-        for w in data:
-            if not isinstance(w, dict):
-                continue
-            try:
-                wid = int(w.get("id") or w.get("warehouseId") or 0)
-            except Exception:
-                wid = 0
-            if wid <= 0:
-                continue
-
-            name = fix_mojibake(_safe_str(w.get("name") or w.get("warehouseName") or ""))
-            address = fix_mojibake(_safe_str(w.get("address") or w.get("fullAddress") or ""))
-            out[wid] = {"name": name, "address": address}
-
-    _WAREHOUSES_CACHE = (now, out)
-    return out
-
-def mp_pick_warehouse_id_by_name(name: str) -> Optional[int]:
-    n = _norm_ws(name)
-    if not n:
-        return None
-    ws = mp_get_seller_warehouses()
-    for wid, meta in ws.items():
-        wn = _norm_ws(meta.get("name", ""))
-        if wn and (wn == n or n in wn or wn in n):
-            return wid
-    return None
-
-def mp_warehouse_label(warehouse_id: Optional[int], fallback_name: str = "") -> str:
-    ws = mp_get_seller_warehouses()
-    if warehouse_id and int(warehouse_id) in ws:
-        meta = ws[int(warehouse_id)]
-        name = meta.get("name") or ""
-        addr = meta.get("address") or ""
-        if name and addr and addr not in name:
-            return f"{name} ({addr})"
-        return name or addr or fallback_name
-    return fallback_name
-
 def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, int]:
     if not WB_MP_TOKEN or not warehouse_id:
         return {}
@@ -523,23 +460,6 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
 
     _STOCKS_CACHE[cache_key] = (now, out)
     return out
-
-
-def resolve_chrt_id(nm_id: Optional[int], barcode_or_sku: str) -> int:
-    """Resolve chrtId by nmId + barcode (order sku) via Content API sizes."""
-    if not nm_id:
-        return 0
-    bc = _safe_str(barcode_or_sku)
-    if not bc:
-        return 0
-    for s in content_get_sizes(int(nm_id)):
-        skus = s.get("skus") or []
-        if bc in skus:
-            try:
-                return int(s.get("chrtId") or 0)
-            except Exception:
-                return 0
-    return 0
 
 
 # -------------------------
@@ -710,15 +630,7 @@ def mp_fetch_new_orders() -> List[Tuple[str, Dict[str, Any]]]:
 
 def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
     oid = _safe_str(o.get("_id"))
-    # В новых заказах marketplace обычно приходит warehouseId (склад продавца), а не warehouseName.
-    wid_raw = o.get("warehouseId") or o.get("warehouseID")
-    try:
-        wid = int(wid_raw) if wid_raw is not None else None
-    except Exception:
-        wid = None
-
-    warehouse_fallback = fix_mojibake(_safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or ""))
-    warehouse = mp_warehouse_label(wid, fallback_name=warehouse_fallback)
+    warehouse = fix_mojibake(_safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or ""))
     header = f"🏬 Новый заказ ({kind}) · {SHOP_NAME}"
 
     items = _extract_items_from_mp_order(o)
@@ -733,11 +645,9 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         if ci > 0:
             chrt_ids.append(ci)
 
-    # Остатки берём по фактическому складу заказа (warehouseId), иначе — по фиксированному env.
-    inv_warehouse_id = str(wid) if wid else SELLER_WAREHOUSE_ID
     stocks_map: Dict[int, int] = {}
-    if inv_warehouse_id and chrt_ids:
-        stocks_map = mp_get_inventory_map(inv_warehouse_id, chrt_ids)
+    if SELLER_WAREHOUSE_ID and chrt_ids:
+        stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
 
     lines: List[str] = []
     total_qty = 0
@@ -855,7 +765,6 @@ def stats_fetch_orders_since(cursor_name: str) -> List[Dict[str, Any]]:
 
 def format_stats_order(o: Dict[str, Any]) -> str:
     warehouse = fix_mojibake(_safe_str(o.get("warehouseName") or o.get("warehouse") or o.get("officeName") or "WB"))
-    warehouse_type = fix_mojibake(_safe_str(o.get("warehouseType") or ""))
 
     nm_id_raw = o.get("nmId") or o.get("nmID") or o.get("nm_id")
     nm_id: Optional[int] = None
@@ -898,48 +807,53 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or 0
     )
 
-    is_cancel = bool(o.get("isCancel"))
-    cancel_dt = _format_dt_ru(_safe_str(o.get("cancelDate") or "")) if is_cancel else ""
-    created = _format_dt_ru(_safe_str(o.get("date") or o.get("lastChangeDate") or ""))
-
-    # Остаток:
-    # - для "Склад продавца" считаем через Marketplace Seller Warehouses stocks (POST /api/v3/stocks/{warehouseId})
-    # - для WB-складов оставляем fallback через statistics /supplier/stocks
     ostatok_line = "Остаток: -"
+    q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
+    if isinstance(q, int):
+        ostatok_line = f"Остаток: {q} шт"
 
-    if warehouse_type.lower().find("склад продавца") >= 0 or not warehouse_type:
-        chrt_id = resolve_chrt_id(nm_id, barcode)
-
-        wid = mp_pick_warehouse_id_by_name(warehouse) if warehouse else None
-        inv_wid = str(wid) if wid else SELLER_WAREHOUSE_ID
-
-        if inv_wid and chrt_id:
-            sm = mp_get_inventory_map(inv_wid, [chrt_id])
-            if chrt_id in sm:
-                ostatok_line = f"Остаток: {sm[chrt_id]} шт"
-    # fallback: если это реально FBW/FBO (WB-склад)
-    if ostatok_line.endswith("-"):
-        q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
-        if isinstance(q, int):
-            ostatok_line = f"Остаток: {q} шт"
-
-    if is_cancel:
-        header = f"❌ Отмена заказа · {SHOP_NAME}"
-    else:
-        header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
+    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
 
     body = (
-        f"📦 Склад: {warehouse}\n"
-        + (f"Тип склада: {warehouse_type}\n" if warehouse_type else "")
-        + f"• {product_name}\n"
-        + f"  Артикул WB: {nm_id or '-'}\n"
-        + f"  — {qty} шт • Сумма: {_rub(price)}\n"
-        + f"{ostatok_line}\n"
-        + f"Дата: {created}"
-        + (f"\nОтменён: {cancel_dt}" if cancel_dt else "")
+        f"📦 Склад отгрузки: {warehouse}\n"
+        f"• {product_name}\n"
+        f"  Артикул WB: {nm_id or '-'}\n"
+        f"  — {qty} шт • Покупка на сумму - {_rub(price)}\n"
+        f"{ostatok_line}\n"
+        f"Итого позиций: {qty}\n"
+        f"Сумма: {_rub(price)}"
     )
 
     return f"{header}\n{body}".strip()
+
+
+# -------------------------
+# Questions (Q&A)
+# -------------------------
+def questions_fetch(is_answered: bool) -> List[Dict[str, Any]]:
+    if not WB_FEEDBACKS_TOKEN:
+        return []
+
+    url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
+    data = wb_get(
+        url,
+        WB_FEEDBACKS_TOKEN,
+        params={
+            "isAnswered": "true" if is_answered else "false",
+            "take": 100,
+            "skip": 0
+        },
+    )
+
+    if isinstance(data, dict) and data.get("__error__"):
+        return [{"__error__": True, **data, "__stage__": f"questions isAnswered={is_answered}"}]
+
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        qs = data["data"].get("questions", [])
+        if isinstance(qs, list):
+            return [q for q in qs if isinstance(q, dict)]
+
+    return []
 
 def format_question(q: Dict[str, Any]) -> str:
     qid = _safe_str(q.get("id"))
@@ -1130,20 +1044,16 @@ def format_sale_event(s: Dict[str, Any]) -> str:
     except Exception:
         price_f = 0.0
 
-    sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
-    is_return = (price_f < 0) or sale_id.upper().startswith("R")
-
     created = _format_dt_ru(_safe_str(s.get("date") or s.get("lastChangeDate") or ""))
 
-    kind = "✅ Выкуп" if not is_return else "↩️ Возврат/отказ"
+    kind = "✅ Выкуп" if price_f >= 0 else "↩️ Возврат/отказ"
     return (
         f"{kind} · {SHOP_NAME}\n"
         f"Склад: {warehouse}\n"
         f"Товар: {name}\n"
         f"Артикул WB: {nm_id or '-'}\n"
         f"Сумма: {_rub(abs(price_f))}\n"
-        + (f"ID: {sale_id}\n" if sale_id else "")
-        + f"Дата: {created}"
+        f"Дата: {created}"
     ).strip()
 
 async def poll_sales_loop():
@@ -1195,40 +1105,26 @@ def _price_from_row(row: Dict[str, Any]) -> float:
     return 0.0
 
 def daily_summary_text(today: datetime) -> str:
-    """
-    Сводка за день (по МСК):
-      - "Продано" = оформленные заказы из statistics /supplier/orders (flag=1, dateFrom=YYYY-MM-DD)
-      - "Выкуплено" = выкупы из statistics /supplier/sales (flag=1) без возвратов
-      - "Отмен/отказов" = отмены из orders (isCancel=true) + возвраты из sales
-    Примечание: WB прямо пишет, что отчёты обновляются каждые ~30 минут и данные предварительные.
-    """
     if not WB_STATS_TOKEN:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
 
+    # 1) Заказы (продажи в смысле "оформлено заказов") — supplier/orders
     orders_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
-
+    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str})
     orders_cnt = 0
     orders_sum = 0.0
-    cancels_cnt = 0
-    cancels_sum = 0.0
-
     if isinstance(orders, list):
         for o in orders:
             if not isinstance(o, dict):
                 continue
-            p = max(0.0, _price_from_row(o))
-            if bool(o.get("isCancel")):
-                cancels_cnt += 1
-                cancels_sum += p
-            else:
-                orders_cnt += 1
-                orders_sum += p
+            orders_cnt += 1
+            orders_sum += max(0.0, _price_from_row(o))
     elif isinstance(orders, dict) and orders.get("__error__") and orders.get("status_code") not in (429, 502, 503, 504):
         return f"⚠️ Суточная сводка: ошибка statistics orders {orders.get('status_code')} · {SHOP_NAME}"
 
+    # 2) Выкупы + возвраты — supplier/sales?flag=1
     sales_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
     sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
 
@@ -1243,7 +1139,7 @@ def daily_summary_text(today: datetime) -> str:
                 continue
             p = _price_from_row(s)
             sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
-            is_return = (p < 0) or sale_id.upper().startswith("R")
+            is_return = (p < 0) or (sale_id.upper().startswith("R"))
             if is_return:
                 returns_cnt += 1
                 returns_sum += abs(p)
@@ -1253,28 +1149,44 @@ def daily_summary_text(today: datetime) -> str:
     elif isinstance(sales, dict) and sales.get("__error__") and sales.get("status_code") not in (429, 502, 503, 504):
         return f"⚠️ Суточная сводка: ошибка statistics sales {sales.get('status_code')} · {SHOP_NAME}"
 
-    # Формат максимально близко к твоему:
-    # "товаров продано на сумму" = сумма оформленных (не отменённых) заказов
-    # "выкуп товаров произведен на сумму" = сумма выкупов без возвратов
-    txt = f"""📊 Итог дня · {SHOP_NAME}
-Дата (МСК): {day_str}
+    return f"""📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}
+🧾 Заказы (оформлено): {orders_cnt}
+Сумма заказов: {_rub(orders_sum)}
+✅ Выкупы: {buyouts_cnt}
+Товаров выкуплено на сумму: {_rub(buyouts_sum)}
+↩️ Отказы/возвраты: {returns_cnt}
+Сумма отказов/возвратов: {_rub(returns_sum)}
+Отзывы/вопросы: см. уведомления (если были — ты их получил)""".strip()
 
-🛒 Товаров продано (оформлено заказов): {orders_cnt} шт
-На сумму: {_rub(orders_sum)}
 
-✅ Выкуп товаров произведён: {buyouts_cnt} шт
-На сумму: {_rub(buyouts_sum)}"""
+# -------------------------
+# Poll loops
+# -------------------------
+async def poll_marketplace_loop():
+    while True:
+        try:
+            orders = mp_fetch_new_orders()
+            for kind, o in orders:
+                if DEBUG_RAW_ORDERS:
+                    debug_key = f"debug:raw:{kind}:{o.get('_id','')}"
+                    if not was_sent(debug_key):
+                        tg_send("DEBUG RAW ORDER:\n" + json.dumps(o, ensure_ascii=False, indent=2)[:3500])
+                        mark_sent(debug_key)
 
-    # по желанию — добавляем отдельно отмены/отказы
-    txt += f"""
+                key = f"mp:{kind}:{o.get('_id','')}"
+                if was_sent(key):
+                    continue
 
-❌ Отменено заказов: {cancels_cnt} шт
-На сумму: {_rub(cancels_sum)}
+                res = tg_send(format_mp_order(kind, o))
+                if res.get("ok"):
+                    mark_sent(key)
+        except Exception as e:
+            ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
+            if not was_sent(ek):
+                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+                mark_sent(ek)
 
-↩️ Возвраты/отказы (по продажам): {returns_cnt} шт
-На сумму: {_rub(returns_sum)}"""
-
-    return txt.strip()
+        await asyncio.sleep(POLL_FBS_SECONDS)
 
 async def poll_fbw_loop():
     while True:
