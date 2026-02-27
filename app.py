@@ -54,6 +54,9 @@ WB_MARKETPLACE_BASE = "https://marketplace-api.wildberries.ru"
 WB_STATISTICS_BASE = "https://statistics-api.wildberries.ru"
 WB_FEEDBACKS_BASE = "https://feedbacks-api.wildberries.ru"
 WB_CONTENT_BASE = "https://content-api.wildberries.ru"
+# HTTP статусы/ошибки, которые не стоит слать в TG (временные проблемы WB/сети)
+TRANSIENT_HTTP_STATUSES = {429, 502, 503, 504}
+
 
 
 # -------------------------
@@ -250,24 +253,64 @@ def _decode_json_from_response(r: requests.Response) -> Any:
     except Exception:
         return (raw.decode("utf-8", errors="replace") or r.text)
 
-def _wb_request_with_429_retry(method: str, url: str, headers: dict, *, params=None, json_payload=None, timeout: int = 25) -> requests.Response:
-    r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
+def _wb_request_with_429_retry(method: str, url: str, headers: dict, params: Optional[dict], json_payload: Optional[dict], timeout: int) -> requests.Response:
+    """Один запрос к WB с простыми ретраями на 429/502/503/504 и сетевые таймауты.
+    Важно: НЕ падаем исключением наружу.
+    """
+    attempts = 0
+    backoff = 2
+    last_exc: Optional[Exception] = None
 
-    # 429 — лимит. WB отдаёт X-Ratelimit-Retry (секунды)
-    if r.status_code == 429:
-        retry = r.headers.get("X-Ratelimit-Retry")
+    while attempts < 3:
+        attempts += 1
         try:
-            wait_s = int(float(retry)) if retry is not None else 2
-        except Exception:
-            wait_s = 2
-        time.sleep(max(1, min(wait_s, 30)))
-        r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
+            if method == "GET":
+                r = requests.get(url, headers=headers, params=params, timeout=timeout)
+            else:
+                r = requests.post(url, headers=headers, params=params, json=json_payload, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            time.sleep(min(backoff, 15))
+            backoff *= 2
+            continue
 
-    return r
+        # 429: ждём сколько сказали (если есть), иначе чуть-чуть
+        if r.status_code == 429:
+            retry = r.headers.get("X-Ratelimit-Retry")
+            try:
+                wait_s = int(float(retry)) if retry is not None else backoff
+            except Exception:
+                wait_s = backoff
+            time.sleep(max(1, min(wait_s, 30)))
+            backoff *= 2
+            continue
+
+        # временные 5xx — чуть подождём и повторим
+        if r.status_code in (502, 503, 504):
+            time.sleep(min(backoff, 15))
+            backoff *= 2
+            continue
+
+        return r
+
+    # если так и не получилось — пробрасываем как псевдо-ответ через исключение выше уровнем
+    if last_exc is not None:
+        raise last_exc
+    return r  # type: ignore
+
 
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
-    r = _wb_request_with_429_retry("GET", url, headers, params=params, timeout=timeout)
+    try:
+        r = _wb_request_with_429_retry("GET", url, headers=headers, params=params, json_payload=None, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        return {
+            "__error__": True,
+            "status_code": 0,
+            "url": url,
+            "response_text": str(e),
+            "error_type": type(e).__name__,
+        }
 
     if r.status_code >= 400:
         return {
@@ -281,9 +324,18 @@ def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 2
 
     return _decode_json_from_response(r)
 
-def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
+def wb_post(url: str, token: str, payload: dict, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
-    r = _wb_request_with_429_retry("POST", url, headers, json_payload=payload, timeout=timeout)
+    try:
+        r = _wb_request_with_429_retry("POST", url, headers=headers, params=params, json_payload=payload, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        return {
+            "__error__": True,
+            "status_code": 0,
+            "url": url,
+            "response_text": str(e),
+            "error_type": type(e).__name__,
+        }
 
     if r.status_code >= 400:
         return {
@@ -296,7 +348,6 @@ def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
         }
 
     return _decode_json_from_response(r)
-
 
 # -------------------------
 # Content API: title + sizes (cache)
@@ -1061,17 +1112,15 @@ async def poll_sales_loop():
         try:
             rows = stats_fetch_sales_since("stats_sales_cursor")
             if rows and isinstance(rows[0], dict) and rows[0].get("__error__"):
-                # 429 — это просто лимит. Не спамим в TG, просто подождём до следующего цикла.
-                if int(rows[0].get("status_code") or 0) == 429:
+                status = rows[0].get('status_code')
+                if isinstance(status, int) and (status in TRANSIENT_HTTP_STATUSES or status == 0):
+                    # 429/5xx/таймауты — временно, не спамим TG
                     pass
                 else:
-                    status = rows[0].get('status_code')
-                    # 429/502/503/504 — это временные сбои/лимиты, не спамим в TG
-                    if status not in (429, 502, 503, 504):
-                        ek = f"err:stats_sales:{status}:{rows[0].get('url','')}"
-                        if not was_sent(ek):
-                            tg_send(f"⚠️ statistics sales error: {status} {rows[0].get('response_text','')[:300]}")
-                            mark_sent(ek)
+                    ek = f"err:stats_sales:{rows[0].get('status_code')}:{rows[0].get('url','')}"
+                    if not was_sent(ek):
+                        tg_send(f"⚠️ statistics sales error: {rows[0].get('status_code')} {rows[0].get('response_text','')[:300]}")
+                        mark_sent(ek)
             else:
                 for s in rows:
                     if not isinstance(s, dict):
@@ -1093,71 +1142,126 @@ async def poll_sales_loop():
 
 
 # -------------------------
-# Daily summary (orders + buyouts + returns)
+# Daily summary (заказы + выкупы + возвраты)
 # -------------------------
-def _price_from_row(row: Dict[str, Any]) -> float:
-    for k in ("forPay", "priceWithDisc", "finishedPrice", "totalPrice", "price"):
-        if row.get(k) is not None:
-            try:
-                return float(row.get(k))
-            except Exception:
-                continue
-    return 0.0
+def _sum_orders_for_day(day_msk: datetime) -> Tuple[int, float]:
+    """
+    'Продажи' как 'заказы' из supplier/orders за сутки (МСК).
+    """
+    if not WB_STATS_TOKEN:
+        return (0, 0.0)
+
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
+    day_start = day_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": iso_msk(day_start)})
+
+    if not isinstance(data, list):
+        return (0, 0.0)
+
+    cnt = 0
+    sm = 0.0
+    for o in data:
+        if not isinstance(o, dict):
+            continue
+        # ограничим только этой датой (на всякий)
+        d = _safe_str(o.get("date") or o.get("lastChangeDate") or "")
+        if d and not d.startswith(day_start.strftime("%Y-%m-%d")):
+            continue
+
+        price = (
+            o.get("priceWithDisc")
+            or o.get("finishedPrice")
+            or o.get("forPay")
+            or o.get("totalPrice")
+            or o.get("price")
+            or 0
+        )
+        try:
+            price_f = float(price)
+        except Exception:
+            price_f = 0.0
+
+        qty = o.get("quantity") or o.get("qty") or 1
+        try:
+            qty_i = int(qty)
+        except Exception:
+            qty_i = 1
+        if qty_i <= 0:
+            qty_i = 1
+
+        cnt += qty_i
+        if price_f > 0:
+            sm += price_f * qty_i
+
+    return (cnt, sm)
 
 def daily_summary_text(today: datetime) -> str:
+    """Суточная сводка (МСК).
+    Разделяем:
+    - Продажи (регистрация продаж)
+    - Выкупы (оплата/выкуп)
+    - Возвраты/отказы
+    Примечание: по данным /supplier/sales, различаем по полю paymentSaleId (если есть) и знаку forPay.
+    """
     if not WB_STATS_TOKEN:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
 
-    # 1) Заказы (продажи в смысле "оформлено заказов") — supplier/orders
-    orders_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str})
-    orders_cnt = 0
-    orders_sum = 0.0
-    if isinstance(orders, list):
-        for o in orders:
-            if not isinstance(o, dict):
-                continue
-            orders_cnt += 1
-            orders_sum += max(0.0, _price_from_row(o))
-    elif isinstance(orders, dict) and orders.get("__error__") and orders.get("status_code") not in (429, 502, 503, 504):
-        return f"⚠️ Суточная сводка: ошибка statistics orders {orders.get('status_code')} · {SHOP_NAME}"
+    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
+    if isinstance(data, dict) and data.get("__error__"):
+        # 429/502 и т.п. мы не спамим в TG, но в сводке покажем, что данных нет
+        return f"⚠️ Суточная сводка: нет данных (ошибка statistics sales {data.get('status_code')}) · {SHOP_NAME}"
 
-    # 2) Выкупы + возвраты — supplier/sales?flag=1
-    sales_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
-    sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
+    if not isinstance(data, list):
+        return f"⚠️ Суточная сводка: нет данных · {SHOP_NAME}"
+
+    sales_cnt = 0
+    sales_sum = 0.0
 
     buyouts_cnt = 0
     buyouts_sum = 0.0
+
     returns_cnt = 0
     returns_sum = 0.0
 
-    if isinstance(sales, list):
-        for s in sales:
-            if not isinstance(s, dict):
-                continue
-            p = _price_from_row(s)
-            sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
-            is_return = (p < 0) or (sale_id.upper().startswith("R"))
-            if is_return:
-                returns_cnt += 1
-                returns_sum += abs(p)
-            else:
-                buyouts_cnt += 1
-                buyouts_sum += max(0.0, p)
-    elif isinstance(sales, dict) and sales.get("__error__") and sales.get("status_code") not in (429, 502, 503, 504):
-        return f"⚠️ Суточная сводка: ошибка statistics sales {sales.get('status_code')} · {SHOP_NAME}"
+    for row in data:
+        if not isinstance(row, dict):
+            continue
 
-    return f"""📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}
-🧾 Заказы (оформлено): {orders_cnt}
-Сумма заказов: {_rub(orders_sum)}
-✅ Выкупы: {buyouts_cnt}
-Товаров выкуплено на сумму: {_rub(buyouts_sum)}
-↩️ Отказы/возвраты: {returns_cnt}
-Сумма отказов/возвратов: {_rub(returns_sum)}
-Отзывы/вопросы: см. уведомления (если были — ты их получил)""".strip()
+        price = row.get("forPay") or row.get("priceWithDisc") or row.get("finishedPrice") or 0
+        try:
+            price_f = float(price)
+        except Exception:
+            price_f = 0.0
 
+        # возвраты/отказы часто идут с отрицательным forPay
+        if price_f < 0:
+            returns_cnt += 1
+            returns_sum += abs(price_f)
+            continue
+
+        # эвристика: paymentSaleId присутствует -> выкуп (оплата)
+        pay_id = row.get("paymentSaleId") or row.get("paymentSaleID") or row.get("paymentSale_id")
+        is_buyout = False
+        if pay_id not in (None, "", 0, "0"):
+            is_buyout = True
+
+        if is_buyout:
+            buyouts_cnt += 1
+            buyouts_sum += price_f
+        else:
+            sales_cnt += 1
+            sales_sum += price_f
+
+    return (
+        f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}\n"
+        f"Продажи: {sales_cnt} шт · {sales_sum:.2f} ₽\n"
+        f"Выкупы: {buyouts_cnt} шт · {buyouts_sum:.2f} ₽\n"
+        f"Возвраты/отказы: {returns_cnt} шт · {returns_sum:.2f} ₽\n"
+        f"Отзывы: см. уведомления (если были — ты их получил)"
+    ).strip()
 
 # -------------------------
 # Poll loops
@@ -1180,26 +1284,15 @@ async def poll_marketplace_loop():
                 res = tg_send(format_mp_order(kind, o))
                 if res.get("ok"):
                     mark_sent(key)
-       except Exception as e:
-    msg = str(e)
-
-    # сетевые ошибки WB — просто игнорируем
-    if any(x in msg for x in (
-        "ConnectTimeout",
-        "ReadTimeout",
-        "Max retries exceeded",
-        "502",
-        "503",
-        "504",
-        "429"
-    )):
-        # молча переживаем
-        pass
-    else:
-        ek = f"err:mp:{type(e).__name__}:{msg[:160]}"
-        if not was_sent(ek):
-            tg_send(f"⚠️ Ошибка marketplace polling: {e}")
-            mark_sent(ek)
+        except Exception as e:
+            # Временные сетевые проблемы WB (таймауты/соединение) — не шлём в TG, просто попробуем позже
+            if isinstance(e, requests.exceptions.RequestException):
+                pass
+            else:
+                ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
+                if not was_sent(ek):
+                    tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+                    mark_sent(ek)
 
         await asyncio.sleep(POLL_FBS_SECONDS)
 
@@ -1208,7 +1301,8 @@ async def poll_fbw_loop():
         try:
             rows = stats_fetch_orders_since("stats_orders_cursor")
             if rows and isinstance(rows[0], dict) and rows[0].get("__error__"):
-                if int(rows[0].get("status_code") or 0) == 429:
+                status = rows[0].get('status_code')
+                if isinstance(status, int) and (status in TRANSIENT_HTTP_STATUSES or status == 0):
                     pass
                 else:
                     ek = f"err:stats_orders:{rows[0].get('status_code')}:{rows[0].get('url','')}"
