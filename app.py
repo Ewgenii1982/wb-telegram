@@ -1180,11 +1180,26 @@ async def poll_marketplace_loop():
                 res = tg_send(format_mp_order(kind, o))
                 if res.get("ok"):
                     mark_sent(key)
-        except Exception as e:
-            ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
-            if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
-                mark_sent(ek)
+       except Exception as e:
+    msg = str(e)
+
+    # сетевые ошибки WB — просто игнорируем
+    if any(x in msg for x in (
+        "ConnectTimeout",
+        "ReadTimeout",
+        "Max retries exceeded",
+        "502",
+        "503",
+        "504",
+        "429"
+    )):
+        # молча переживаем
+        pass
+    else:
+        ek = f"err:mp:{type(e).__name__}:{msg[:160]}"
+        if not was_sent(ek):
+            tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+            mark_sent(ek)
 
         await asyncio.sleep(POLL_FBS_SECONDS)
 
