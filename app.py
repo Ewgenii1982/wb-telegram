@@ -199,6 +199,16 @@ def mark_sent(key: str) -> None:
     conn.commit()
     conn.close()
 
+
+def _err_key(prefix: str, e: Exception) -> str:
+    """Делаем стабильный ключ ошибок, чтобы не спамить в TG из‑за адресов объектов в тексте исключения."""
+    try:
+        if isinstance(e, requests.exceptions.RequestException):
+            return f"{prefix}:{type(e).__name__}"
+    except Exception:
+        pass
+    return f"{prefix}:{type(e).__name__}:{str(e)[:160]}"
+
 def get_cursor(name: str, default: str = "") -> str:
     conn = db()
     cur = conn.execute("SELECT value FROM cursors WHERE name = ?", (name,))
@@ -696,9 +706,10 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         if ci > 0:
             chrt_ids.append(ci)
 
+    # Остаток продавца: если SELLER_WAREHOUSE_ID не задан — суммируем по всем складам продавца
     stocks_map: Dict[int, int] = {}
-    if SELLER_WAREHOUSE_ID and chrt_ids:
-        stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
+    if chrt_ids:
+        stocks_map = mp_get_inventory_total(chrt_ids)
 
     lines: List[str] = []
     total_qty = 0
@@ -753,9 +764,9 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         except Exception:
             cid_int = 0
 
-        ost_line = "Остаток: -"
+        ost_line = "Остаток продавца: -"
         if cid_int and cid_int in stocks_map:
-            ost_line = f"Остаток: {stocks_map[cid_int]} шт"
+            ost_line = f"Остаток продавца: {stocks_map[cid_int]} шт"
 
         lines.append(
             f"• {product_name}\n"
@@ -1211,8 +1222,14 @@ def daily_summary_text(today: datetime) -> str:
 
     data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
     if isinstance(data, dict) and data.get("__error__"):
-        # 429/502 и т.п. мы не спамим в TG, но в сводке покажем, что данных нет
-        return f"⚠️ Суточная сводка: нет данных (ошибка statistics sales {data.get('status_code')}) · {SHOP_NAME}"
+        # 429/502 и т.п. — просто пропускаем сводку, чтобы не засорять TG.
+        try:
+            sc = int(data.get("status_code") or 0)
+        except Exception:
+            sc = 0
+        if sc in TRANSIENT_HTTP_STATUSES:
+            return ""
+        return f"⚠️ Суточная сводка: ошибка statistics sales {sc} · {SHOP_NAME}"
 
     if not isinstance(data, list):
         return f"⚠️ Суточная сводка: нет данных · {SHOP_NAME}"
@@ -1285,13 +1302,14 @@ async def poll_marketplace_loop():
                 if res.get("ok"):
                     mark_sent(key)
         except Exception as e:
-            # Временные сетевые проблемы WB (таймауты/соединение) — не шлём в TG, просто попробуем позже
+            # Временные сетевые проблемы WB (таймауты/соединение) — в TG не шлём, просто попробуем позже.
+            # Если вдруг вылетает НЕ сетевое (логика/код) — сообщим 1 раз.
             if isinstance(e, requests.exceptions.RequestException):
                 pass
             else:
-                ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
+                ek = _err_key("err:mp", e)
                 if not was_sent(ek):
-                    tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+                    tg_send(f"⚠️ Ошибка marketplace (код): {type(e).__name__} — проверь логи")
                     mark_sent(ek)
 
         await asyncio.sleep(POLL_FBS_SECONDS)
@@ -1320,9 +1338,9 @@ async def poll_fbw_loop():
                     if res.get("ok"):
                         mark_sent(key)
         except Exception as e:
-            ek = f"err:stats:{type(e).__name__}:{str(e)[:160]}"
+            ek = _err_key("err:stats", e)
             if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка statistics polling: {e}")
+                tg_send(f"⚠️ Ошибка statistics polling: {type(e).__name__}")
                 mark_sent(ek)
 
         await asyncio.sleep(POLL_FBW_SECONDS)
@@ -1352,9 +1370,9 @@ async def poll_feedbacks_loop():
                 if res.get("ok"):
                     mark_sent(key)
         except Exception as e:
-            ek = f"err:feedbacks:{type(e).__name__}:{str(e)[:160]}"
+            ek = _err_key("err:feedbacks", e)
             if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка feedbacks polling: {e}")
+                tg_send(f"⚠️ Ошибка feedbacks polling: {type(e).__name__}")
                 mark_sent(ek)
 
         await asyncio.sleep(POLL_FEEDBACKS_SECONDS)
@@ -1371,8 +1389,10 @@ async def daily_summary_loop():
 
             day_key = f"daily:{target.strftime('%Y-%m-%d')}"
             if not was_sent(day_key):
-                tg_send(daily_summary_text(target))
-                mark_sent(day_key)
+                txt = daily_summary_text(target)
+                if txt:
+                    tg_send(txt)
+                    mark_sent(day_key)
         except Exception as e:
             ek = f"err:daily:{type(e).__name__}:{str(e)[:160]}"
             if not was_sent(ek):
