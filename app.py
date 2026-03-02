@@ -54,9 +54,6 @@ WB_MARKETPLACE_BASE = "https://marketplace-api.wildberries.ru"
 WB_STATISTICS_BASE = "https://statistics-api.wildberries.ru"
 WB_FEEDBACKS_BASE = "https://feedbacks-api.wildberries.ru"
 WB_CONTENT_BASE = "https://content-api.wildberries.ru"
-# HTTP статусы/ошибки, которые не стоит слать в TG (временные проблемы WB/сети)
-TRANSIENT_HTTP_STATUSES = {429, 502, 503, 504}
-
 
 
 # -------------------------
@@ -199,16 +196,6 @@ def mark_sent(key: str) -> None:
     conn.commit()
     conn.close()
 
-
-def _err_key(prefix: str, e: Exception) -> str:
-    """Делаем стабильный ключ ошибок, чтобы не спамить в TG из‑за адресов объектов в тексте исключения."""
-    try:
-        if isinstance(e, requests.exceptions.RequestException):
-            return f"{prefix}:{type(e).__name__}"
-    except Exception:
-        pass
-    return f"{prefix}:{type(e).__name__}:{str(e)[:160]}"
-
 def get_cursor(name: str, default: str = "") -> str:
     conn = db()
     cur = conn.execute("SELECT value FROM cursors WHERE name = ?", (name,))
@@ -263,64 +250,24 @@ def _decode_json_from_response(r: requests.Response) -> Any:
     except Exception:
         return (raw.decode("utf-8", errors="replace") or r.text)
 
-def _wb_request_with_429_retry(method: str, url: str, headers: dict, params: Optional[dict], json_payload: Optional[dict], timeout: int) -> requests.Response:
-    """Один запрос к WB с простыми ретраями на 429/502/503/504 и сетевые таймауты.
-    Важно: НЕ падаем исключением наружу.
-    """
-    attempts = 0
-    backoff = 2
-    last_exc: Optional[Exception] = None
+def _wb_request_with_429_retry(method: str, url: str, headers: dict, *, params=None, json_payload=None, timeout: int = 25) -> requests.Response:
+    r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
 
-    while attempts < 3:
-        attempts += 1
+    # 429 — лимит. WB отдаёт X-Ratelimit-Retry (секунды)
+    if r.status_code == 429:
+        retry = r.headers.get("X-Ratelimit-Retry")
         try:
-            if method == "GET":
-                r = requests.get(url, headers=headers, params=params, timeout=timeout)
-            else:
-                r = requests.post(url, headers=headers, params=params, json=json_payload, timeout=timeout)
-        except requests.exceptions.RequestException as e:
-            last_exc = e
-            time.sleep(min(backoff, 15))
-            backoff *= 2
-            continue
+            wait_s = int(float(retry)) if retry is not None else 2
+        except Exception:
+            wait_s = 2
+        time.sleep(max(1, min(wait_s, 30)))
+        r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
 
-        # 429: ждём сколько сказали (если есть), иначе чуть-чуть
-        if r.status_code == 429:
-            retry = r.headers.get("X-Ratelimit-Retry")
-            try:
-                wait_s = int(float(retry)) if retry is not None else backoff
-            except Exception:
-                wait_s = backoff
-            time.sleep(max(1, min(wait_s, 30)))
-            backoff *= 2
-            continue
-
-        # временные 5xx — чуть подождём и повторим
-        if r.status_code in (502, 503, 504):
-            time.sleep(min(backoff, 15))
-            backoff *= 2
-            continue
-
-        return r
-
-    # если так и не получилось — пробрасываем как псевдо-ответ через исключение выше уровнем
-    if last_exc is not None:
-        raise last_exc
-    return r  # type: ignore
-
+    return r
 
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
-    try:
-        r = _wb_request_with_429_retry("GET", url, headers=headers, params=params, json_payload=None, timeout=timeout)
-    except requests.exceptions.RequestException as e:
-        return {
-            "__error__": True,
-            "status_code": 0,
-            "url": url,
-            "response_text": str(e),
-            "error_type": type(e).__name__,
-        }
+    r = _wb_request_with_429_retry("GET", url, headers, params=params, timeout=timeout)
 
     if r.status_code >= 400:
         return {
@@ -334,18 +281,9 @@ def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 2
 
     return _decode_json_from_response(r)
 
-def wb_post(url: str, token: str, payload: dict, params: Optional[dict] = None, timeout: int = 25) -> Any:
+def wb_post(url: str, token: str, payload: dict, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
-    try:
-        r = _wb_request_with_429_retry("POST", url, headers=headers, params=params, json_payload=payload, timeout=timeout)
-    except requests.exceptions.RequestException as e:
-        return {
-            "__error__": True,
-            "status_code": 0,
-            "url": url,
-            "response_text": str(e),
-            "error_type": type(e).__name__,
-        }
+    r = _wb_request_with_429_retry("POST", url, headers, json_payload=payload, timeout=timeout)
 
     if r.status_code >= 400:
         return {
@@ -358,6 +296,7 @@ def wb_post(url: str, token: str, payload: dict, params: Optional[dict] = None, 
         }
 
     return _decode_json_from_response(r)
+
 
 # -------------------------
 # Content API: title + sizes (cache)
@@ -522,6 +461,93 @@ def mp_get_inventory_map(warehouse_id: str, chrt_ids: List[int]) -> Dict[int, in
     _STOCKS_CACHE[cache_key] = (now, out)
     return out
 
+
+# -------------------------
+# Seller warehouses (marketplace /api/v3/warehouses) cache
+# -------------------------
+_WAREHOUSES_CACHE: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+_WAREHOUSES_TTL = 300
+
+def mp_list_warehouses() -> List[Dict[str, Any]]:
+    global _WAREHOUSES_CACHE
+    if not WB_MP_TOKEN:
+        return []
+    now = time.time()
+    ts, cached = _WAREHOUSES_CACHE
+    if cached and (now - ts) <= _WAREHOUSES_TTL:
+        return cached
+
+    url = f"{WB_MARKETPLACE_BASE}/api/v3/warehouses"
+    data = wb_get(url, WB_MP_TOKEN, params=None)
+    if not isinstance(data, list):
+        return []
+    out = [w for w in data if isinstance(w, dict)]
+    _WAREHOUSES_CACHE = (now, out)
+    return out
+
+def _warehouse_id_by_name(warehouse_name: str) -> str:
+    # 1) явный ENV
+    if SELLER_WAREHOUSE_ID:
+        return SELLER_WAREHOUSE_ID
+
+    wn = _norm_ws(warehouse_name)
+    if not wn:
+        return ""
+
+    best_id = ""
+    best_score = 0
+    for w in mp_list_warehouses():
+        wid = _safe_str(w.get("id") or w.get("warehouseId") or w.get("warehouseID") or "")
+        wname = _norm_ws(w.get("name") or w.get("warehouseName") or w.get("officeName") or "")
+        if not wid or not wname:
+            continue
+        if wn == wname:
+            return wid
+        if wn in wname or wname in wn:
+            score = min(len(wn), len(wname))
+            if score > best_score:
+                best_score = score
+                best_id = wid
+
+    return best_id
+
+def seller_stock_quantity(warehouse_name: str, barcode: str, nm_id: Optional[int] = None, supplier_article: str = "") -> Optional[int]:
+    if not WB_MP_TOKEN:
+        return None
+    if not nm_id:
+        return None
+
+    bc = _safe_str(barcode)
+    sizes = content_get_sizes(int(nm_id))
+    if not sizes:
+        return None
+
+    chrt_id = 0
+    if bc:
+        for s in sizes:
+            if bc in (s.get("skus") or []):
+                try:
+                    chrt_id = int(s.get("chrtId") or 0)
+                except Exception:
+                    chrt_id = 0
+                break
+    if chrt_id <= 0 and len(sizes) == 1:
+        try:
+            chrt_id = int(sizes[0].get("chrtId") or 0)
+        except Exception:
+            chrt_id = 0
+
+    if chrt_id <= 0:
+        return None
+
+    wid = _warehouse_id_by_name(warehouse_name)
+    if not wid:
+        return None
+
+    inv = mp_get_inventory_map(wid, [chrt_id])
+    if chrt_id in inv:
+        return inv[chrt_id]
+    return None
 
 # -------------------------
 # FBW stocks (Statistics supplier/stocks) cache
@@ -706,10 +732,9 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         if ci > 0:
             chrt_ids.append(ci)
 
-    # Остаток продавца: если SELLER_WAREHOUSE_ID не задан — суммируем по всем складам продавца
     stocks_map: Dict[int, int] = {}
-    if chrt_ids:
-        stocks_map = mp_get_inventory_total(chrt_ids)
+    if SELLER_WAREHOUSE_ID and chrt_ids:
+        stocks_map = mp_get_inventory_map(SELLER_WAREHOUSE_ID, chrt_ids)
 
     lines: List[str] = []
     total_qty = 0
@@ -764,9 +789,9 @@ def format_mp_order(kind: str, o: Dict[str, Any]) -> str:
         except Exception:
             cid_int = 0
 
-        ost_line = "Остаток продавца: -"
+        ost_line = "Остаток: -"
         if cid_int and cid_int in stocks_map:
-            ost_line = f"Остаток продавца: {stocks_map[cid_int]} шт"
+            ost_line = f"Остаток: {stocks_map[cid_int]} шт"
 
         lines.append(
             f"• {product_name}\n"
@@ -869,18 +894,32 @@ def format_stats_order(o: Dict[str, Any]) -> str:
         or 0
     )
 
+    # Отмена (statistics /supplier/orders)
+    is_cancel = bool(o.get("isCancel") or o.get("is_cancel") or False)
+    cancel_date = _format_dt_ru(_safe_str(o.get("cancelDate") or o.get("cancel_date") or ""))
+
+    # Остатки: сначала "склад продавца" (marketplace /api/v3/stocks/{warehouseId}),
+    # если не получилось — fallback на FBW stocks (statistics /supplier/stocks)
     ostatok_line = "Остаток: -"
-    q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
+    q = seller_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
+    if not isinstance(q, int):
+        q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
     if isinstance(q, int):
         ostatok_line = f"Остаток: {q} шт"
 
-    header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
+    if is_cancel:
+        header = f"❌ Отмена заказа со склада ({warehouse}) · {SHOP_NAME}"
+    else:
+        header = f"🏬 Заказ товара со склада ({warehouse}) · {SHOP_NAME}"
+
+    cancel_line = f"Дата отмены: {cancel_date}\n" if (is_cancel and cancel_date) else ""
 
     body = (
         f"📦 Склад отгрузки: {warehouse}\n"
         f"• {product_name}\n"
         f"  Артикул WB: {nm_id or '-'}\n"
         f"  — {qty} шт • Покупка на сумму - {_rub(price)}\n"
+        f"{cancel_line}"
         f"{ostatok_line}\n"
         f"Итого позиций: {qty}\n"
         f"Сумма: {_rub(price)}"
@@ -1108,7 +1147,10 @@ def format_sale_event(s: Dict[str, Any]) -> str:
 
     created = _format_dt_ru(_safe_str(s.get("date") or s.get("lastChangeDate") or ""))
 
-    kind = "✅ Выкуп" if price_f >= 0 else "↩️ Возврат/отказ"
+    sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
+    is_return = (price_f < 0) or (sale_id.upper().startswith("R"))
+
+    kind = "✅ Выкуп" if not is_return else "↩️ Возврат/отказ"
     return (
         f"{kind} · {SHOP_NAME}\n"
         f"Склад: {warehouse}\n"
@@ -1123,15 +1165,17 @@ async def poll_sales_loop():
         try:
             rows = stats_fetch_sales_since("stats_sales_cursor")
             if rows and isinstance(rows[0], dict) and rows[0].get("__error__"):
-                status = rows[0].get('status_code')
-                if isinstance(status, int) and (status in TRANSIENT_HTTP_STATUSES or status == 0):
-                    # 429/5xx/таймауты — временно, не спамим TG
+                # 429 — это просто лимит. Не спамим в TG, просто подождём до следующего цикла.
+                if int(rows[0].get("status_code") or 0) == 429:
                     pass
                 else:
-                    ek = f"err:stats_sales:{rows[0].get('status_code')}:{rows[0].get('url','')}"
-                    if not was_sent(ek):
-                        tg_send(f"⚠️ statistics sales error: {rows[0].get('status_code')} {rows[0].get('response_text','')[:300]}")
-                        mark_sent(ek)
+                    status = rows[0].get('status_code')
+                    # 429/502/503/504 — это временные сбои/лимиты, не спамим в TG
+                    if status not in (429, 502, 503, 504):
+                        ek = f"err:stats_sales:{status}:{rows[0].get('url','')}"
+                        if not was_sent(ek):
+                            tg_send(f"⚠️ statistics sales error: {status} {rows[0].get('response_text','')[:300]}")
+                            mark_sent(ek)
             else:
                 for s in rows:
                     if not isinstance(s, dict):
@@ -1153,132 +1197,102 @@ async def poll_sales_loop():
 
 
 # -------------------------
-# Daily summary (заказы + выкупы + возвраты)
+# Daily summary (orders + buyouts + returns)
 # -------------------------
-def _sum_orders_for_day(day_msk: datetime) -> Tuple[int, float]:
-    """
-    'Продажи' как 'заказы' из supplier/orders за сутки (МСК).
-    """
-    if not WB_STATS_TOKEN:
-        return (0, 0.0)
-
-    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    day_start = day_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": iso_msk(day_start)})
-
-    if not isinstance(data, list):
-        return (0, 0.0)
-
-    cnt = 0
-    sm = 0.0
-    for o in data:
-        if not isinstance(o, dict):
-            continue
-        # ограничим только этой датой (на всякий)
-        d = _safe_str(o.get("date") or o.get("lastChangeDate") or "")
-        if d and not d.startswith(day_start.strftime("%Y-%m-%d")):
-            continue
-
-        price = (
-            o.get("priceWithDisc")
-            or o.get("finishedPrice")
-            or o.get("forPay")
-            or o.get("totalPrice")
-            or o.get("price")
-            or 0
-        )
-        try:
-            price_f = float(price)
-        except Exception:
-            price_f = 0.0
-
-        qty = o.get("quantity") or o.get("qty") or 1
-        try:
-            qty_i = int(qty)
-        except Exception:
-            qty_i = 1
-        if qty_i <= 0:
-            qty_i = 1
-
-        cnt += qty_i
-        if price_f > 0:
-            sm += price_f * qty_i
-
-    return (cnt, sm)
+def _price_from_row(row: Dict[str, Any]) -> float:
+    for k in ("forPay", "priceWithDisc", "finishedPrice", "totalPrice", "price"):
+        if row.get(k) is not None:
+            try:
+                return float(row.get(k))
+            except Exception:
+                continue
+    return 0.0
 
 def daily_summary_text(today: datetime) -> str:
-    """Суточная сводка (МСК).
-    Разделяем:
-    - Продажи (регистрация продаж)
-    - Выкупы (оплата/выкуп)
-    - Возвраты/отказы
-    Примечание: по данным /supplier/sales, различаем по полю paymentSaleId (если есть) и знаку forPay.
-    """
     if not WB_STATS_TOKEN:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
-    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
 
-    data = wb_get(url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
-    if isinstance(data, dict) and data.get("__error__"):
-        # 429/502 и т.п. — просто пропускаем сводку, чтобы не засорять TG.
-        try:
-            sc = int(data.get("status_code") or 0)
-        except Exception:
-            sc = 0
-        if sc in TRANSIENT_HTTP_STATUSES:
-            return ""
-        return f"⚠️ Суточная сводка: ошибка statistics sales {sc} · {SHOP_NAME}"
+    # 1) Оформленные заказы — supplier/orders
+    orders_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
+    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str})
 
-    if not isinstance(data, list):
-        return f"⚠️ Суточная сводка: нет данных · {SHOP_NAME}"
+    sold_qty = 0
+    sold_sum = 0.0
+    cancel_qty = 0
+    cancel_sum = 0.0
 
-    sales_cnt = 0
-    sales_sum = 0.0
+    if isinstance(orders, list):
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            qty_raw = o.get("quantity") or o.get("qty") or 1
+            try:
+                qty = int(qty_raw)
+            except Exception:
+                qty = 1
+            if qty <= 0:
+                qty = 1
 
-    buyouts_cnt = 0
+            p = max(0.0, _price_from_row(o))
+            is_cancel = bool(o.get("isCancel") or o.get("is_cancel") or False)
+            if is_cancel:
+                cancel_qty += qty
+                cancel_sum += p
+            else:
+                sold_qty += qty
+                sold_sum += p
+    elif isinstance(orders, dict) and orders.get("__error__") and orders.get("status_code") not in (429, 502, 503, 504):
+        return f"⚠️ Суточная сводка: ошибка statistics orders {orders.get('status_code')} · {SHOP_NAME}"
+
+    # 2) Выкупы + возвраты — supplier/sales?flag=1
+    sales_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
+    sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
+
+    buyouts_qty = 0
     buyouts_sum = 0.0
-
-    returns_cnt = 0
+    returns_qty = 0
     returns_sum = 0.0
 
-    for row in data:
-        if not isinstance(row, dict):
-            continue
+    if isinstance(sales, list):
+        for s in sales:
+            if not isinstance(s, dict):
+                continue
+            qty_raw = s.get("quantity") or s.get("qty") or 1
+            try:
+                qty = int(qty_raw)
+            except Exception:
+                qty = 1
+            if qty <= 0:
+                qty = 1
 
-        price = row.get("forPay") or row.get("priceWithDisc") or row.get("finishedPrice") or 0
-        try:
-            price_f = float(price)
-        except Exception:
-            price_f = 0.0
+            p = _price_from_row(s)
+            sale_id = _safe_str(s.get("saleID") or s.get("saleId") or "")
+            is_return = (p < 0) or (sale_id.upper().startswith("R"))
+            if is_return:
+                returns_qty += qty
+                returns_sum += abs(p)
+            else:
+                buyouts_qty += qty
+                buyouts_sum += max(0.0, p)
+    elif isinstance(sales, dict) and sales.get("__error__") and sales.get("status_code") not in (429, 502, 503, 504):
+        return f"⚠️ Суточная сводка: ошибка statistics sales {sales.get('status_code')} · {SHOP_NAME}"
 
-        # возвраты/отказы часто идут с отрицательным forPay
-        if price_f < 0:
-            returns_cnt += 1
-            returns_sum += abs(price_f)
-            continue
+    msg = (
+        f"📊 Итоги дня за {day_str} (МСК) · {SHOP_NAME}\n"
+        f"🛒 Товаров продано на сумму: {_rub(sold_sum)}\n"
+        f"   Кол-во товаров: {sold_qty} шт\n"
+        f"✅ Выкуп товаров произведен на сумму: {_rub(buyouts_sum)}\n"
+        f"   Кол-во выкупленных: {buyouts_qty} шт\n"
+        f"❌ Отменено/аннулировано на сумму: {_rub(cancel_sum)}\n"
+        f"   Кол-во отменённых: {cancel_qty} шт\n"
+        f"↩️ Отказы/возвраты на сумму: {_rub(returns_sum)}\n"
+        f"   Кол-во отказов/возвратов: {returns_qty} шт"
+    )
 
-        # эвристика: paymentSaleId присутствует -> выкуп (оплата)
-        pay_id = row.get("paymentSaleId") or row.get("paymentSaleID") or row.get("paymentSale_id")
-        is_buyout = False
-        if pay_id not in (None, "", 0, "0"):
-            is_buyout = True
+    return msg.strip()
 
-        if is_buyout:
-            buyouts_cnt += 1
-            buyouts_sum += price_f
-        else:
-            sales_cnt += 1
-            sales_sum += price_f
-
-    return (
-        f"📊 Суточная сводка за {day_str} (МСК) · {SHOP_NAME}\n"
-        f"Продажи: {sales_cnt} шт · {sales_sum:.2f} ₽\n"
-        f"Выкупы: {buyouts_cnt} шт · {buyouts_sum:.2f} ₽\n"
-        f"Возвраты/отказы: {returns_cnt} шт · {returns_sum:.2f} ₽\n"
-        f"Отзывы: см. уведомления (если были — ты их получил)"
-    ).strip()
 
 # -------------------------
 # Poll loops
@@ -1302,15 +1316,10 @@ async def poll_marketplace_loop():
                 if res.get("ok"):
                     mark_sent(key)
         except Exception as e:
-            # Временные сетевые проблемы WB (таймауты/соединение) — в TG не шлём, просто попробуем позже.
-            # Если вдруг вылетает НЕ сетевое (логика/код) — сообщим 1 раз.
-            if isinstance(e, requests.exceptions.RequestException):
-                pass
-            else:
-                ek = _err_key("err:mp", e)
-                if not was_sent(ek):
-                    tg_send(f"⚠️ Ошибка marketplace (код): {type(e).__name__} — проверь логи")
-                    mark_sent(ek)
+            ek = f"err:mp:{type(e).__name__}:{str(e)[:160]}"
+            if not was_sent(ek):
+                tg_send(f"⚠️ Ошибка marketplace polling: {e}")
+                mark_sent(ek)
 
         await asyncio.sleep(POLL_FBS_SECONDS)
 
@@ -1319,8 +1328,7 @@ async def poll_fbw_loop():
         try:
             rows = stats_fetch_orders_since("stats_orders_cursor")
             if rows and isinstance(rows[0], dict) and rows[0].get("__error__"):
-                status = rows[0].get('status_code')
-                if isinstance(status, int) and (status in TRANSIENT_HTTP_STATUSES or status == 0):
+                if int(rows[0].get("status_code") or 0) == 429:
                     pass
                 else:
                     ek = f"err:stats_orders:{rows[0].get('status_code')}:{rows[0].get('url','')}"
@@ -1338,9 +1346,9 @@ async def poll_fbw_loop():
                     if res.get("ok"):
                         mark_sent(key)
         except Exception as e:
-            ek = _err_key("err:stats", e)
+            ek = f"err:stats:{type(e).__name__}:{str(e)[:160]}"
             if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка statistics polling: {type(e).__name__}")
+                tg_send(f"⚠️ Ошибка statistics polling: {e}")
                 mark_sent(ek)
 
         await asyncio.sleep(POLL_FBW_SECONDS)
@@ -1370,9 +1378,9 @@ async def poll_feedbacks_loop():
                 if res.get("ok"):
                     mark_sent(key)
         except Exception as e:
-            ek = _err_key("err:feedbacks", e)
+            ek = f"err:feedbacks:{type(e).__name__}:{str(e)[:160]}"
             if not was_sent(ek):
-                tg_send(f"⚠️ Ошибка feedbacks polling: {type(e).__name__}")
+                tg_send(f"⚠️ Ошибка feedbacks polling: {e}")
                 mark_sent(ek)
 
         await asyncio.sleep(POLL_FEEDBACKS_SECONDS)
@@ -1389,10 +1397,8 @@ async def daily_summary_loop():
 
             day_key = f"daily:{target.strftime('%Y-%m-%d')}"
             if not was_sent(day_key):
-                txt = daily_summary_text(target)
-                if txt:
-                    tg_send(txt)
-                    mark_sent(day_key)
+                tg_send(daily_summary_text(target))
+                mark_sent(day_key)
         except Exception as e:
             ek = f"err:daily:{type(e).__name__}:{str(e)[:160]}"
             if not was_sent(ek):
