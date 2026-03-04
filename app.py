@@ -10,9 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import ORJSONResponse
-
-app = FastAPI(default_response_class=ORJSONResponse)
+from fastapi.responses import JSONResponse
+app = FastAPI(default_response_class=JSONResponse)
 
 # -------------------------
 # Config (ENV)
@@ -30,13 +29,13 @@ WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()     # Content API (
 SHOP_NAME = os.getenv("SHOP_NAME", "Bright Shop").strip()
 DB_PATH = os.getenv("DB_PATH", "/tmp/wb_telegram.sqlite").strip()
 
-POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "20"))
-POLL_FEEDBACKS_SECONDS = int(os.getenv("POLL_FEEDBACKS_SECONDS", "60"))
-POLL_QUESTIONS_SECONDS = int(os.getenv("POLL_QUESTIONS_SECONDS", "60"))
-POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "1800"))
+POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "30"))
+POLL_FEEDBACKS_SECONDS = int(os.getenv("POLL_FEEDBACKS_SECONDS", "180"))
+POLL_QUESTIONS_SECONDS = int(os.getenv("POLL_QUESTIONS_SECONDS", "180"))
+POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "3600"))
 
 # polling выкупов/продаж (statistics/sales)
-POLL_SALES_SECONDS = int(os.getenv("POLL_SALES_SECONDS", "120"))
+POLL_SALES_SECONDS = int(os.getenv("POLL_SALES_SECONDS", "600"))
 
 DAILY_SUMMARY_HOUR_MSK = int(os.getenv("DAILY_SUMMARY_HOUR_MSK", "23"))
 DAILY_SUMMARY_MINUTE_MSK = int(os.getenv("DAILY_SUMMARY_MINUTE_MSK", "55"))
@@ -250,20 +249,55 @@ def _decode_json_from_response(r: requests.Response) -> Any:
     except Exception:
         return (raw.decode("utf-8", errors="replace") or r.text)
 
+_WB_COOLDOWN_UNTIL: dict[str, float] = {}
+
 def _wb_request_with_429_retry(method: str, url: str, headers: dict, *, params=None, json_payload=None, timeout: int = 25) -> requests.Response:
-    r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
+    """
+    Устойчивые запросы к WB:
+    - уважает 429 (X-Ratelimit-Retry / Retry-After) и ставит cooldown по хосту
+    - ретраи на сетевые обрывы (RemoteDisconnected/SSLError/etc.)
+    - экспоненциальный backoff с потолком
+    """
+    try:
+        host = requests.utils.urlparse(url).hostname or ""
+    except Exception:
+        host = ""
 
-    # 429 — лимит. WB отдаёт X-Ratelimit-Retry (секунды)
-    if r.status_code == 429:
-        retry = r.headers.get("X-Ratelimit-Retry")
+    # если по хосту включён cooldown — подождём чуть-чуть
+    now = time.time()
+    until = _WB_COOLDOWN_UNTIL.get(host, 0.0)
+    if until > now:
+        time.sleep(min(60, max(1, until - now)))
+
+    backoff = 1.0
+    last_resp: Optional[requests.Response] = None
+
+    for attempt in range(1, 6):  # до 5 попыток
         try:
-            wait_s = int(float(retry)) if retry is not None else 2
-        except Exception:
-            wait_s = 2
-        time.sleep(max(1, min(wait_s, 30)))
-        r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
+            r = requests.request(method, url, headers=headers, params=params, json=json_payload, timeout=timeout)
+            last_resp = r
 
-    return r
+            if r.status_code != 429:
+                return r
+
+            retry = r.headers.get("X-Ratelimit-Retry") or r.headers.get("Retry-After")
+            try:
+                wait_s = int(float(retry)) if retry is not None else int(backoff)
+            except Exception:
+                wait_s = int(backoff)
+
+            wait_s = max(2, min(wait_s, 300))
+            _WB_COOLDOWN_UNTIL[host] = time.time() + wait_s
+            time.sleep(wait_s)
+
+        except requests.RequestException:
+            time.sleep(min(30, backoff))
+
+        backoff = min(30.0, backoff * 2.0)
+
+    if last_resp is not None:
+        return last_resp
+    raise
 
 def wb_get(url: str, token: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
     headers = {"Authorization": token}
