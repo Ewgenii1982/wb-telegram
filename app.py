@@ -692,6 +692,69 @@ def fbw_stock_quantity(warehouse: str, barcode: str, nm_id: Optional[int] = None
 # -------------------------
 # Marketplace: new orders (FBS/DBS/DBW)
 # -------------------------
+
+def fbw_stock_total(barcode: str, nm_id: Optional[int] = None, supplier_article: str = "") -> Optional[int]:
+    """Суммарный остаток FBW (склады WB) по всем складам.
+    1) Суммируем по точному barcode (самый точный вариант для размера/варианта).
+    2) Если barcode нет/не найден — суммируем по nmId.
+    3) Если nmId нет/не найден — пробуем по supplierArticle.
+    """
+    bc = _safe_str(barcode)
+    sa = _norm_ws(supplier_article)
+    rows = stats_fetch_fbw_stocks()
+    if not rows:
+        return None
+
+    def pick_qty(r: Dict[str, Any]) -> int:
+        for k in ("quantityFull", "quantity", "QuantityFull", "Quantity"):
+            if k in r:
+                try:
+                    return int(r.get(k) or 0)
+                except Exception:
+                    return 0
+        return 0
+
+    total = 0
+    matched = 0
+
+    if bc:
+        for r in rows:
+            if isinstance(r, dict) and _safe_str(r.get("barcode")) == bc:
+                total += pick_qty(r)
+                matched += 1
+        if matched:
+            return total
+
+    if nm_id is not None:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("nmId") or r.get("nmID") or r.get("nm_id")
+            if rid is None:
+                continue
+            try:
+                if int(float(rid)) == int(nm_id):
+                    total += pick_qty(r)
+                    matched += 1
+            except Exception:
+                continue
+        if matched:
+            return total
+
+    if sa:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rsa = _norm_ws(r.get("supplierArticle") or r.get("vendorCode") or r.get("article") or "")
+            if rsa == sa:
+                total += pick_qty(r)
+                matched += 1
+        if matched:
+            return total
+
+    return None
+
+
 def _extract_items_from_mp_order(o: Dict[str, Any]) -> List[Dict[str, Any]]:
     items = o.get("items")
     if isinstance(items, list) and items:
@@ -932,12 +995,9 @@ def format_stats_order(o: Dict[str, Any]) -> str:
     is_cancel = bool(o.get("isCancel") or o.get("is_cancel") or False)
     cancel_date = _format_dt_ru(_safe_str(o.get("cancelDate") or o.get("cancel_date") or ""))
 
-    # Остатки: сначала "склад продавца" (marketplace /api/v3/stocks/{warehouseId}),
-    # если не получилось — fallback на FBW stocks (statistics /supplier/stocks)
+        # Остатки (FBW/склады WB): суммарно по всем складам по barcode/nmId
     ostatok_line = "Остаток: -"
-    q = seller_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
-    if not isinstance(q, int):
-        q = fbw_stock_quantity(warehouse, barcode, nm_id=nm_id, supplier_article=supplier_article)
+    q = fbw_stock_total(barcode, nm_id=nm_id, supplier_article=supplier_article)
     if isinstance(q, int):
         ostatok_line = f"Остаток: {q} шт"
 
@@ -1230,6 +1290,12 @@ async def poll_sales_loop():
         await asyncio.sleep(POLL_SALES_SECONDS)
 
 
+
+def _msk_day_start_iso(day: datetime) -> str:
+    """Старт суток в МСК в формате RFC3339 для Statistics API."""
+    # МСК = UTC+3 без переходов
+    return day.strftime("%Y-%m-%dT00:00:00+03:00")
+
 # -------------------------
 # Daily summary (orders + buyouts + returns)
 # -------------------------
@@ -1247,10 +1313,11 @@ def daily_summary_text(today: datetime) -> str:
         return f"⚠️ Суточная сводка: нет WB_STATS_TOKEN · {SHOP_NAME}"
 
     day_str = today.strftime("%Y-%m-%d")
+    date_from = _msk_day_start_iso(today)
 
     # 1) Оформленные заказы — supplier/orders
     orders_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": day_str})
+    orders = wb_get(orders_url, WB_STATS_TOKEN, params={"dateFrom": date_from, "flag": 1})
 
     sold_qty = 0
     sold_sum = 0.0
@@ -1277,12 +1344,12 @@ def daily_summary_text(today: datetime) -> str:
             else:
                 sold_qty += qty
                 sold_sum += p
-    elif isinstance(orders, dict) and orders.get("__error__") and orders.get("status_code") not in (429, 502, 503, 504):
-        return f"⚠️ Суточная сводка: ошибка statistics orders {orders.get('status_code')} · {SHOP_NAME}"
+    elif isinstance(orders, dict) and orders.get("__error__"):
+        return f"⚠️ Суточная сводка: не удалось получить orders (status {orders.get('status_code')}) · {SHOP_NAME}"
 
     # 2) Выкупы + возвраты — supplier/sales?flag=1
     sales_url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
-    sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": day_str, "flag": 1})
+    sales = wb_get(sales_url, WB_STATS_TOKEN, params={"dateFrom": date_from, "flag": 1})
 
     buyouts_qty = 0
     buyouts_sum = 0.0
@@ -1310,8 +1377,8 @@ def daily_summary_text(today: datetime) -> str:
             else:
                 buyouts_qty += qty
                 buyouts_sum += max(0.0, p)
-    elif isinstance(sales, dict) and sales.get("__error__") and sales.get("status_code") not in (429, 502, 503, 504):
-        return f"⚠️ Суточная сводка: ошибка statistics sales {sales.get('status_code')} · {SHOP_NAME}"
+    elif isinstance(sales, dict) and sales.get("__error__"):
+        return f"⚠️ Суточная сводка: не удалось получить sales (status {sales.get('status_code')}) · {SHOP_NAME}"
 
     msg = (
         f"📊 Итоги дня за {day_str} (МСК) · {SHOP_NAME}\n"
