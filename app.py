@@ -1614,7 +1614,8 @@ def debug_title(nm_id: int):
 @app.on_event("startup")
 async def startup():
     _ = db()
-    prime_feedbacks_silently()
+    # Не блокируем запуск (Render ждёт открытый порт после startup)
+    asyncio.create_task(asyncio.to_thread(prime_feedbacks_silently))
 
     asyncio.create_task(poll_marketplace_loop())
     asyncio.create_task(poll_sales_loop())
