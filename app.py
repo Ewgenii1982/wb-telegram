@@ -629,6 +629,14 @@ async def startup() -> None:
 # Background Worker entrypoint (Render Background Worker)
 # ---------------------------
 
+
+
+def prime_feedbacks_silently():
+    """Optional warm-up step.
+    In some deployments this function may be absent; we keep a no-op implementation
+    so the worker can start reliably.
+    """
+    return
 async def run_worker() -> None:
     # Initialize DB and prime feedbacks in background (never block)
     asyncio.create_task(asyncio.to_thread(db))
