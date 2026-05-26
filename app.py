@@ -1614,8 +1614,15 @@ def debug_title(nm_id: int):
 @app.on_event("startup")
 async def startup():
     _ = db()
-    # Не блокируем запуск (Render ждёт открытый порт после startup)
+    # ⚠️ В startup нельзя делать блокирующие HTTP-запросы — Render ждёт открытый порт только после завершения startup().
+    # Все сетевые "прогревы" и уведомления запускаем в фоне.
     asyncio.create_task(asyncio.to_thread(prime_feedbacks_silently))
+
+    if not DISABLE_STARTUP_HELLO:
+        asyncio.create_task(asyncio.to_thread(
+            tg_send,
+            "✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой), выкупы и отзывы/вопросы."
+        ))
 
     asyncio.create_task(poll_marketplace_loop())
     asyncio.create_task(poll_sales_loop())
@@ -1623,6 +1630,3 @@ async def startup():
     asyncio.create_task(poll_fbw_loop())
     asyncio.create_task(daily_summary_loop())
     asyncio.create_task(poll_questions_loop())
-
-    if not DISABLE_STARTUP_HELLO:
-        tg_send("✅ WB→Telegram запущен. Жду заказы (FBS/DBS/DBW), FBW (с задержкой), выкупы и отзывы/вопросы.")
