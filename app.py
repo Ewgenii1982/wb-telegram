@@ -2187,3 +2187,31 @@ async def startup():
     asyncio.create_task(poll_fbw_loop())
     asyncio.create_task(daily_summary_loop())
     asyncio.create_task(poll_questions_loop())
+# --- Worker entrypoint (Render Background Worker) ---
+async def run_worker():
+    # НИЧЕГО не блокируем: всё тяжёлое в фоне
+    asyncio.create_task(asyncio.to_thread(db))
+    asyncio.create_task(asyncio.to_thread(prime_feedbacks_silently))
+
+    # Запускаем циклы бота
+    asyncio.create_task(poll_marketplace_loop())
+    asyncio.create_task(poll_sales_loop())
+    asyncio.create_task(poll_feedbacks_loop())
+    asyncio.create_task(poll_fbw_loop())
+    asyncio.create_task(daily_summary_loop())
+    asyncio.create_task(poll_questions_loop())
+
+    # Сообщение о старте в фоне (не блокирует запуск)
+    if not DISABLE_STARTUP_HELLO:
+        asyncio.create_task(asyncio.to_thread(
+            tg_send,
+            "✅ WB→Telegram запущен (Worker)."
+        ))
+
+    # Держим процесс живым всегда
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_worker())
+
