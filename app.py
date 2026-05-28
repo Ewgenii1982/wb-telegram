@@ -1,24 +1,13 @@
-"""WB → Telegram notifier (Render-safe)
+#!/usr/bin/env python3
+"""
+WB → Telegram bot (Render Background Worker)
 
-Key goals for Render Web Service:
-- startup MUST finish fast so uvicorn opens the port (Render port scan).
-- absolutely no blocking network or sqlite work inside startup.
+ONLY:
+  1) New FBS orders notifications (Marketplace API /api/v3/orders/new)
+  2) Daily summary at 23:50 MSK (Statistics API: supplier/orders + supplier/sales)
 
-This file:
-- runs all network/db warmups in background tasks (threads) after startup.
-- exposes /health for quick checks.
-- uses conservative polling intervals + per-host cooldown/backoff to avoid 429/502 storms.
-
-Env vars (names preserved from earlier versions):
-- TG_BOT_TOKEN, TG_CHAT_ID
-- WB_STATS_TOKEN, WB_FEEDBACKS_TOKEN, WB_MP_TOKEN, WB_CONTENT_TOKEN
-- DB_PATH (default: /tmp/wb_bot.sqlite)
-- DISABLE_STARTUP_HELLO (1 to disable)
-- POLL_*_SECONDS (optional):
-  POLL_SALES_SECONDS, POLL_FBW_SECONDS, POLL_FEEDBACKS_SECONDS, POLL_QUESTIONS_SECONDS, POLL_FBS_SECONDS
-- DAILY_SUMMARY_HOUR_MSK, DAILY_SUMMARY_MINUTE_MSK
-
-Note: For FBW/FBO (stock on WB), stocks should come from statistics supplier/stocks.
+Everything else is intentionally removed.
+Run command (Render Background Worker): python app.py
 """
 
 from __future__ import annotations
@@ -29,633 +18,379 @@ import os
 import random
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from zoneinfo import ZoneInfo
 
-# ---------------------------
-# Config
-# ---------------------------
-
+# ------------------- ENV -------------------
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()
-WB_FEEDBACKS_TOKEN = os.getenv("WB_FEEDBACKS_TOKEN", "").strip()
-WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()
-WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()
+WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()          # Marketplace (FBS orders)
+WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()    # Statistics (daily report)
 
-# Base URLs (override via Render env if needed)
-WB_MARKETPLACE_BASE = os.getenv("WB_MARKETPLACE_BASE", "https://marketplace-api.wildberries.ru").rstrip("/")
-WB_STATISTICS_BASE  = os.getenv("WB_STATISTICS_BASE",  "https://statistics-api.wildberries.ru").rstrip("/")
-WB_FEEDBACKS_BASE   = os.getenv("WB_FEEDBACKS_BASE",   "https://feedbacks-api.wildberries.ru").rstrip("/")
+SHOP_NAME = os.getenv("SHOP_NAME", "Магазин").strip()
 
+DB_PATH = (os.getenv("DB_PATH", "/tmp/wb_bot.sqlite").strip() or "/tmp/wb_bot.sqlite")
 
-DB_PATH = os.getenv("DB_PATH", "/tmp/wb_bot.sqlite").strip() or "/tmp/wb_bot.sqlite"
-
-DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip() in {"1", "true", "True", "yes", "YES"}
-
-# Conservative defaults (to reduce 429/502). You can override in Render env.
-POLL_SALES_SECONDS = int(os.getenv("POLL_SALES_SECONDS", "600"))
-POLL_FBW_SECONDS = int(os.getenv("POLL_FBW_SECONDS", "3600"))
-POLL_FEEDBACKS_SECONDS = int(os.getenv("POLL_FEEDBACKS_SECONDS", "300"))
-POLL_QUESTIONS_SECONDS = int(os.getenv("POLL_QUESTIONS_SECONDS", "300"))
 POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "30"))
-
 DAILY_SUMMARY_HOUR_MSK = int(os.getenv("DAILY_SUMMARY_HOUR_MSK", "23"))
 DAILY_SUMMARY_MINUTE_MSK = int(os.getenv("DAILY_SUMMARY_MINUTE_MSK", "50"))
+DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip().lower() in ("1", "true", "yes")
 
-# MSK is UTC+3
-MSK = timezone(timedelta(hours=3))
+# Bases (optional override via ENV, but have safe defaults)
+WB_MARKETPLACE_BASE = os.getenv("WB_MARKETPLACE_BASE", "https://marketplace-api.wildberries.ru").rstrip("/")
+WB_STATISTICS_BASE = os.getenv("WB_STATISTICS_BASE", "https://statistics-api.wildberries.ru").rstrip("/")
+TG_API_BASE = "https://api.telegram.org"
 
-# ---------------------------
-# HTTP helpers
-# ---------------------------
-
-DEFAULT_TIMEOUT = (5, 30)  # connect, read
-
-# per-host cooldown timestamp (epoch seconds)
-_HOST_COOLDOWN: Dict[str, float] = {}
+MSK = ZoneInfo("Europe/Moscow")
 
 
-def _now() -> float:
-    return time.time()
-
-
-def _cooldown_left(host: str) -> float:
-    until = _HOST_COOLDOWN.get(host, 0.0)
-    left = until - _now()
-    return left if left > 0 else 0.0
-
-
-def _set_cooldown(host: str, seconds: float) -> None:
-    _HOST_COOLDOWN[host] = max(_HOST_COOLDOWN.get(host, 0.0), _now() + seconds)
-
-
-def _host_from_url(url: str) -> str:
-    try:
-        return url.split("//", 1)[1].split("/", 1)[0]
-    except Exception:
-        return url
-
-
-def http_get_json(url: str, headers: Dict[str, str], params: Optional[Dict[str, Any]] = None) -> Any:
-    """Blocking GET with cooldown + backoff on transient errors.
-
-    Returns parsed JSON on success, or raises requests.HTTPError for non-retriable errors.
-    """
-    host = _host_from_url(url)
-
-    # Respect cooldown
-    left = _cooldown_left(host)
-    if left > 0:
-        raise RuntimeError(f"cooldown {host} {left:.0f}s")
-
-    # Exponential backoff attempts
-    base_sleep = 1.0
-    for attempt in range(1, 6):
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
-            if r.status_code == 429:
-                # WB limiter; back off hard
-                retry = 60
-                try:
-                    retry = int(r.headers.get("Retry-After") or retry)
-                except Exception:
-                    pass
-                _set_cooldown(host, max(60, retry))
-                raise RuntimeError(f"429 Too Many Requests ({host})")
-
-            if r.status_code in (502, 503, 504):
-                # Gateway issues
-                sleep_s = min(300, base_sleep * (2 ** (attempt - 1)))
-                _set_cooldown(host, sleep_s)
-                raise RuntimeError(f"{r.status_code} gateway ({host})")
-
-            if r.status_code >= 400:
-                # Non-transient
-                try:
-                    detail = r.json()
-                except Exception:
-                    detail = r.text[:500]
-                raise requests.HTTPError(f"{r.status_code} {detail}")
-
-            return r.json()
-
-        except (requests.ConnectionError, requests.Timeout) as e:
-            # Network hiccup
-            sleep_s = min(120, base_sleep * (2 ** (attempt - 1))) + random.uniform(0, 2)
-            _set_cooldown(host, sleep_s)
-            if attempt == 5:
-                raise RuntimeError(f"network error {host}: {e}")
-        except ValueError as e:
-            # JSON parse
-            raise RuntimeError(f"bad json {host}: {e}")
-
-    raise RuntimeError(f"http_get_json failed {url}")
-
-
-# ---------------------------
-# Telegram
-# ---------------------------
-
-
-def tg_send(text: str) -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ TG creds missing; message skipped")
-        return
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=(5, 20))
-        if r.status_code >= 400:
-            print(f"⚠️ TG send error {r.status_code}: {r.text[:300]}")
-    except Exception as e:
-        print(f"⚠️ TG send exception: {e}")
-
-
-# ---------------------------
-# DB (minimal)
-# ---------------------------
-
-_DB_CONN: Optional[sqlite3.Connection] = None
+# ------------------- SQLite (dedup + kv) -------------------
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def db() -> sqlite3.Connection:
-    global _DB_CONN
-    if _DB_CONN is None:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        _DB_CONN = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _DB_CONN.execute(
-            "CREATE TABLE IF NOT EXISTS sent (k TEXT PRIMARY KEY, ts INTEGER)"
-        )
-        _DB_CONN.commit()
-    return _DB_CONN
+    _ensure_parent_dir(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("CREATE TABLE IF NOT EXISTS seen_fbs_orders (order_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+    conn.commit()
+    return conn
 
 
-def dedup_seen(key: str, ttl_days: int = 30) -> bool:
-    """Return True if key already seen, else store and return False."""
-    conn = db()
-    now_ts = int(time.time())
+def kv_get(conn: sqlite3.Connection, k: str, default: str = "") -> str:
+    row = conn.execute("SELECT v FROM kv WHERE k=? LIMIT 1", (k,)).fetchone()
+    return row[0] if row else default
+
+
+def kv_set(conn: sqlite3.Connection, k: str, v: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)", (k, v))
+    conn.commit()
+
+
+def seen_order(conn: sqlite3.Connection, order_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM seen_fbs_orders WHERE order_id=? LIMIT 1", (order_id,)).fetchone() is not None
+
+
+def mark_seen(conn: sqlite3.Connection, order_id: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO seen_fbs_orders(order_id, seen_at) VALUES(?,?)",
+        (order_id, datetime.now(tz=MSK).isoformat()),
+    )
+    conn.commit()
+
+
+# ------------------- Telegram -------------------
+def tg_send(text: str) -> None:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    url = f"{TG_API_BASE}/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True}
     try:
-        row = conn.execute("SELECT 1 FROM sent WHERE k=?", (key,)).fetchone()
-        if row:
-            return True
-        conn.execute("INSERT OR REPLACE INTO sent(k, ts) VALUES(?, ?)", (key, now_ts))
-        # light cleanup
-        cutoff = now_ts - ttl_days * 86400
-        conn.execute("DELETE FROM sent WHERE ts < ?", (cutoff,))
-        conn.commit()
-        return False
-    except Exception as e:
-        print(f"⚠️ DB dedup error: {e}")
-        return False
+        requests.post(url, json=payload, timeout=(5, 30))
+    except Exception:
+        # Never crash worker because of Telegram
+        pass
 
 
-# ---------------------------
-# WB API wrappers (Statistics + Feedbacks)
-# ---------------------------
+# ------------------- HTTP helper (backoff + host cooldown) -------------------
+@dataclass
+class Cooldown:
+    until_ts: float = 0.0
+
+
+_HOST_COOLDOWN: Dict[str, Cooldown] = {}
+
+
+def _sleep_with_jitter(base: float) -> None:
+    time.sleep(base + random.random() * min(1.5, max(0.2, base * 0.2)))
+
+
+def _set_cooldown(url: str, seconds: float) -> None:
+    host = requests.utils.urlparse(url).netloc
+    _HOST_COOLDOWN[host] = Cooldown(until_ts=time.time() + seconds)
+
+
+def _respect_cooldown(url: str) -> None:
+    host = requests.utils.urlparse(url).netloc
+    cd = _HOST_COOLDOWN.get(host)
+    if cd and time.time() < cd.until_ts:
+        _sleep_with_jitter(max(0.0, cd.until_ts - time.time()))
+
+
+def http_json(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: Tuple[float, float] = (8, 40),
+    max_tries: int = 6,
+) -> Any:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_tries + 1):
+        _respect_cooldown(url)
+        try:
+            resp = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
+
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else min(120.0, 5.0 * attempt)
+                _set_cooldown(url, wait)
+                _sleep_with_jitter(wait)
+                continue
+
+            if resp.status_code in (502, 503, 504):
+                wait = min(180.0, 8.0 * attempt)
+                _set_cooldown(url, wait)
+                _sleep_with_jitter(wait)
+                continue
+
+            if resp.status_code >= 400:
+                return {"_http_status": resp.status_code, "_text": resp.text}
+
+            # Sometimes WB gateways return HTML
+            if resp.text.strip().startswith("<"):
+                wait = min(180.0, 8.0 * attempt)
+                _set_cooldown(url, wait)
+                _sleep_with_jitter(wait)
+                continue
+
+            return resp.json()
+
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_err = e
+            _sleep_with_jitter(min(120.0, 2.0 ** attempt))
+        except Exception as e:
+            last_err = e
+            _sleep_with_jitter(min(30.0, 2.0 ** attempt))
+
+    raise last_err or RuntimeError("http_json failed")
+
+
+# ------------------- WB API -------------------
+def mp_headers() -> Dict[str, str]:
+    return {"Authorization": WB_MP_TOKEN}
 
 
 def stats_headers() -> Dict[str, str]:
     return {"Authorization": WB_STATS_TOKEN}
 
 
-def feedbacks_headers() -> Dict[str, str]:
-    return {"Authorization": WB_FEEDBACKS_TOKEN}
+def mp_get_new_fbs_orders() -> List[Dict[str, Any]]:
+    url = f"{WB_MARKETPLACE_BASE}/api/v3/orders/new"
+    data = http_json("GET", url, headers=mp_headers())
+    if isinstance(data, dict) and "_http_status" in data:
+        raise RuntimeError(f"marketplace http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
+    if isinstance(data, dict):
+        orders = data.get("orders")
+        if isinstance(orders, list):
+            return orders
+    return data if isinstance(data, list) else []
 
 
-def rfc3339_msk_start_of_day(d: datetime) -> str:
-    d0 = d.astimezone(MSK).replace(hour=0, minute=0, second=0, microsecond=0)
-    # format like 2026-03-03T00:00:00+03:00
-    return d0.isoformat(timespec="seconds")
+def _datefrom_for_day(day_msk: datetime) -> str:
+    # Keep explicit +03:00 in ISO string (MSK)
+    return day_msk.astimezone(MSK).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
-def get_sales(date_from: datetime) -> List[Dict[str, Any]]:
-    if not WB_STATS_TOKEN:
-        raise RuntimeError("WB_STATS_TOKEN missing")
-    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
-    params = {"dateFrom": rfc3339_msk_start_of_day(date_from), "flag": 1}
-    return http_get_json(url, stats_headers(), params=params) or []
-
-
-def get_orders(date_from: datetime) -> List[Dict[str, Any]]:
-    if not WB_STATS_TOKEN:
-        raise RuntimeError("WB_STATS_TOKEN missing")
+def stats_orders_for_day(day_msk: datetime) -> List[Dict[str, Any]]:
     url = f"{WB_STATISTICS_BASE}/api/v1/supplier/orders"
-    params = {"dateFrom": rfc3339_msk_start_of_day(date_from), "flag": 1}
-    return http_get_json(url, stats_headers(), params=params) or []
+    params = {"dateFrom": _datefrom_for_day(day_msk), "flag": 1}
+    data = http_json("GET", url, headers=stats_headers(), params=params)
+    if isinstance(data, dict) and "_http_status" in data:
+        raise RuntimeError(f"statistics orders http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
+    return data if isinstance(data, list) else []
 
 
-def get_stocks_full(date_from: datetime) -> List[Dict[str, Any]]:
-    if not WB_STATS_TOKEN:
-        raise RuntimeError("WB_STATS_TOKEN missing")
-    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/stocks"
-    params = {"dateFrom": rfc3339_msk_start_of_day(date_from)}
-    return http_get_json(url, stats_headers(), params=params) or []
+def stats_sales_for_day(day_msk: datetime) -> List[Dict[str, Any]]:
+    url = f"{WB_STATISTICS_BASE}/api/v1/supplier/sales"
+    params = {"dateFrom": _datefrom_for_day(day_msk), "flag": 1}
+    data = http_json("GET", url, headers=stats_headers(), params=params)
+    if isinstance(data, dict) and "_http_status" in data:
+        raise RuntimeError(f"statistics sales http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
+    return data if isinstance(data, list) else []
 
 
-def get_feedbacks_page(is_answered: bool, take: int = 100, skip: int = 0) -> List[Dict[str, Any]]:
-    if not WB_FEEDBACKS_TOKEN:
-        raise RuntimeError("WB_FEEDBACKS_TOKEN missing")
-    url = f"{WB_FEEDBACKS_BASE}/api/v1/feedbacks"
-    params = {
-        "isAnswered": str(is_answered).lower(),
-        "take": take,
-        "skip": skip,
-        "order": "dateDesc",
-    }
-    return http_get_json(url, feedbacks_headers(), params=params) or []
-
-
-def get_questions_page(is_answered: bool, take: int = 100, skip: int = 0) -> List[Dict[str, Any]]:
-    if not WB_FEEDBACKS_TOKEN:
-        raise RuntimeError("WB_FEEDBACKS_TOKEN missing")
-    url = f"{WB_FEEDBACKS_BASE}/api/v1/questions"
-    params = {
-        "isAnswered": str(is_answered).lower(),
-        "take": take,
-        "skip": skip,
-        "order": "dateDesc",
-    }
-    return http_get_json(url, feedbacks_headers(), params=params) or []
-
-
-# ---------------------------
-# Business logic (minimal but correct direction)
-# ---------------------------
-
-
+# ------------------- Formatting -------------------
 def _money(v: Any) -> float:
     try:
-        return float(v)
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        return float(str(v).replace(",", ".").strip())
     except Exception:
         return 0.0
 
 
-def classify_sale(s: Dict[str, Any]) -> str:
-    # WB commonly uses saleID starting with 'R' for returns; also negative forPay.
-    sale_id = str(s.get("saleID") or "")
-    for_pay = _money(s.get("forPay"))
-    if sale_id.startswith("R") or for_pay < 0:
-        return "return"
-    return "sale"
-
-
-def sale_amount(s: Dict[str, Any]) -> float:
-    # Prefer forPay (amount to pay to seller). Fallbacks.
-    for k in ("forPay", "finishedPrice", "priceWithDisc", "totalPrice"):
-        if k in s:
-            v = _money(s.get(k))
-            if v != 0:
-                return v
-    return 0.0
-
-
-def order_amount(o: Dict[str, Any]) -> float:
-    for k in ("finishedPrice", "priceWithDisc", "totalPrice"):
+def _best_sum(o: Dict[str, Any], keys: Iterable[str]) -> float:
+    for k in keys:
+        if k in o and o[k] not in (None, ""):
+            val = _money(o.get(k))
+            if val != 0:
+                return val
+    for k in keys:
         if k in o:
-            v = _money(o.get(k))
-            if v != 0:
-                return v
+            return _money(o.get(k))
     return 0.0
 
 
-def stock_qty(row: Dict[str, Any]) -> int:
-    for k in ("quantity", "qty", "amount", "quantityFull"):
-        if k in row and row.get(k) is not None:
-            try:
-                return int(float(row.get(k)))
-            except Exception:
-                pass
-    return 0
+def fmt_fbs_order(order: Dict[str, Any]) -> str:
+    oid = str(order.get("id") or order.get("orderId") or order.get("wbOrderId") or "").strip()
+    created = str(order.get("createdAt") or order.get("dateCreated") or "").strip()
+    wh = str(order.get("warehouseName") or order.get("warehouse") or "").strip()
+    items = order.get("items") if isinstance(order.get("items"), list) else []
+
+    lines: List[str] = [f"🧾 Новый заказ FBS · {SHOP_NAME}"]
+    if oid:
+        lines.append(f"Заказ: {oid}")
+    if wh:
+        lines.append(f"Склад: {wh}")
+    if created:
+        lines.append(f"Дата: {created}")
+
+    if items:
+        lines.append("")
+        lines.append("Товары:")
+        for it in items[:30]:
+            name = (it.get("name") or it.get("subject") or it.get("supplierArticle") or "").strip()
+            nm = it.get("nmId") or it.get("nmID") or it.get("article") or ""
+            qty = int(_money(it.get("quantity") or it.get("count") or 1) or 1)
+            price = _best_sum(it, ["priceWithDisc", "price", "totalPrice", "forPay"])
+            s = f"• {name}" if name else "• Товар"
+            if nm:
+                s += f" (nmId: {nm})"
+            s += f" — {qty} шт"
+            if price:
+                s += f" • {price:.2f} ₽"
+            lines.append(s)
+
+    return "\n".join(lines)
 
 
-def sum_stocks_for_item(
-    stocks: List[Dict[str, Any]],
-    nm_id: Optional[int],
-    barcode: Optional[str],
-    supplier_article: Optional[str],
-) -> int:
-    # Best match by barcode, then nmId, then supplierArticle
-    total = 0
-    if barcode:
-        for r in stocks:
-            if str(r.get("barcode") or "") == str(barcode):
-                total += stock_qty(r)
-        if total:
-            return total
+def fmt_daily_report(day_msk: datetime, orders: List[Dict[str, Any]], sales: List[Dict[str, Any]]) -> str:
+    sold_count = sold_sum = 0.0
+    cancel_count = cancel_sum = 0.0
 
-    if nm_id is not None:
-        for r in stocks:
-            try:
-                if int(r.get("nmId") or 0) == int(nm_id):
-                    total += stock_qty(r)
-            except Exception:
-                continue
-        if total:
-            return total
+    for o in orders:
+        is_cancel = bool(o.get("isCancel"))
+        qty = _money(o.get("quantity") or 1) or 1
+        price = _best_sum(o, ["totalPrice", "priceWithDisc", "forPay", "price"])
+        if is_cancel:
+            cancel_count += qty
+            cancel_sum += price
+        else:
+            sold_count += qty
+            sold_sum += price
 
-    if supplier_article:
-        for r in stocks:
-            if str(r.get("supplierArticle") or "") == str(supplier_article):
-                total += stock_qty(r)
-    return total
+    buy_count = buy_sum = 0.0
+    ret_count = ret_sum = 0.0
 
+    for s in sales:
+        sale_id = str(s.get("saleID") or s.get("saleId") or s.get("srid") or "")
+        qty = _money(s.get("quantity") or 1) or 1
+        amount = _best_sum(s, ["forPay", "priceWithDisc", "totalPrice", "price"])
+        is_return = sale_id.startswith("R") or amount < 0
+        if is_return:
+            ret_count += qty
+            ret_sum += abs(amount)
+        else:
+            buy_count += qty
+            buy_sum += amount
 
-# ---------------------------
-# Poll loops
-# ---------------------------
-
-
-def _sleep_with_jitter(seconds: int) -> float:
-    return max(1.0, seconds + random.uniform(0, min(3.0, seconds * 0.1)))
-
-
-async def poll_sales_loop() -> None:
-    # poll today's sales frequently; summary uses same.
-    last_day = datetime.now(MSK).date()
-    while True:
-        try:
-            today = datetime.now(MSK)
-            # If day changed, reset dedup window naturally via keys
-            if today.date() != last_day:
-                last_day = today.date()
-
-            rows = await asyncio.to_thread(get_sales, today)
-            for s in rows:
-                # Dedup key
-                key = f"sale:{s.get('srid') or s.get('saleID') or json.dumps(s, sort_keys=True)[:120]}"
-                if dedup_seen(key):
-                    continue
-
-                kind = classify_sale(s)
-                amt = sale_amount(s)
-                nm = s.get("subject") or s.get("supplierArticle") or "Товар"
-                dt = s.get("date") or s.get("lastChangeDate") or ""
-
-                if kind == "sale":
-                    msg = f"✅ Выкуп\nТовар: {nm}\nСумма: {amt:.2f} ₽\nДата: {dt}"
-                else:
-                    msg = f"↩️ Возврат/отказ\nТовар: {nm}\nСумма: {amt:.2f} ₽\nДата: {dt}"
-                await asyncio.to_thread(tg_send, msg)
-
-        except Exception as e:
-            print(f"⚠️ sales polling error: {e}")
-
-        await asyncio.sleep(_sleep_with_jitter(POLL_SALES_SECONDS))
+    d_str = day_msk.astimezone(MSK).strftime("%d.%m.%Y")
+    return "\n".join(
+        [
+            f"📊 Итоги дня · {SHOP_NAME}",
+            f"Дата: {d_str}",
+            "",
+            f"🧾 FBS заказы (оформлено): {int(sold_count)} шт • {sold_sum:.2f} ₽",
+            f"✅ Выкуп (sales): {int(buy_count)} шт • {buy_sum:.2f} ₽",
+            f"❌ Отмены: {int(cancel_count)} шт • {cancel_sum:.2f} ₽",
+            f"↩️ Возвраты: {int(ret_count)} шт • {ret_sum:.2f} ₽",
+        ]
+    )
 
 
-async def poll_fbw_loop() -> None:
-    # FBW orders + stocks summary. We only use orders here for events; stocks are used for 'Остаток'.
-    # To keep load low, fetch stocks as a cached snapshot periodically.
-    stocks_cache: List[Dict[str, Any]] = []
-    stocks_cache_ts = 0.0
+# ------------------- Loops -------------------
+async def poll_fbs_loop(conn: sqlite3.Connection) -> None:
+    if not WB_MP_TOKEN:
+        await asyncio.to_thread(tg_send, "⚠️ WB_MP_TOKEN не задан — уведомления FBS отключены.")
+        return
 
     while True:
         try:
-            now = datetime.now(MSK)
-
-            # refresh stocks snapshot every 30 minutes; use old dateFrom to approximate "full" list
-            if _now() - stocks_cache_ts > 1800:
-                # Using 2020-01-01 reduces risk of empty stocks due to incremental semantics
-                stocks_cache = await asyncio.to_thread(get_stocks_full, datetime(2020, 1, 1, tzinfo=MSK))
-                stocks_cache_ts = _now()
-
-            # orders for today
-            orders = await asyncio.to_thread(get_orders, now)
+            orders = await asyncio.to_thread(mp_get_new_fbs_orders)
             for o in orders:
-                key = f"order:{o.get('srid') or o.get('gNumber') or o.get('odid') or json.dumps(o, sort_keys=True)[:120]}"
-                if dedup_seen(key):
+                oid = str(o.get("id") or o.get("orderId") or o.get("wbOrderId") or "").strip()
+                if not oid:
+                    oid = str(hash(json.dumps(o, ensure_ascii=False, sort_keys=True)))
+                if seen_order(conn, oid):
                     continue
-
-                is_cancel = bool(o.get("isCancel"))
-                cancel_date = o.get("cancelDate") or ""
-
-                nm_id = None
-                try:
-                    nm_id = int(o.get("nmId") or 0) or None
-                except Exception:
-                    nm_id = None
-                barcode = (o.get("barcode") or "")
-                supplier_article = (o.get("supplierArticle") or "")
-
-                qty = int(float(o.get("quantity") or 1)) if o.get("quantity") is not None else 1
-                amount = order_amount(o)
-
-                stock_sum = sum_stocks_for_item(stocks_cache, nm_id, barcode, supplier_article)
-
-                title = "❌ Отмена заказа" if is_cancel else "🏬 Заказ (FBW)"
-                lines = [
-                    f"{title}",
-                    f"Товар: {o.get('subject') or supplier_article or '—'}",
-                ]
-                if nm_id:
-                    lines.append(f"Артикул WB: {nm_id}")
-                if amount:
-                    lines.append(f"Сумма: {amount:.2f} ₽")
-                lines.append(f"Кол-во: {qty}")
-                lines.append(f"Остаток (сумма по складам WB): {stock_sum}")
-                if is_cancel and cancel_date:
-                    lines.append(f"Дата отмены: {cancel_date}")
-                dt = o.get("date") or o.get("lastChangeDate") or ""
-                if dt:
-                    lines.append(f"Дата: {dt}")
-
-                await asyncio.to_thread(tg_send, "\n".join(lines))
-
+                await asyncio.to_thread(tg_send, fmt_fbs_order(o))
+                mark_seen(conn, oid)
         except Exception as e:
-            print(f"⚠️ FBW polling error: {e}")
+            await asyncio.to_thread(tg_send, f"⚠️ FBS polling error: {e}")
 
-        await asyncio.sleep(_sleep_with_jitter(POLL_FBW_SECONDS))
+        await asyncio.sleep(POLL_FBS_SECONDS + random.random() * 2.0)
 
 
-async def poll_feedbacks_loop() -> None:
+def _next_summary_dt(now_msk: datetime) -> datetime:
+    target = now_msk.astimezone(MSK).replace(
+        hour=DAILY_SUMMARY_HOUR_MSK,
+        minute=DAILY_SUMMARY_MINUTE_MSK,
+        second=0,
+        microsecond=0,
+    )
+    if target <= now_msk:
+        target += timedelta(days=1)
+    return target
+
+
+async def daily_summary_loop(conn: sqlite3.Connection) -> None:
+    if not WB_STATS_TOKEN:
+        await asyncio.to_thread(tg_send, "⚠️ WB_STATS_TOKEN не задан — суточный отчёт отключён.")
+        return
+
     while True:
+        now = datetime.now(tz=MSK)
+        nxt = _next_summary_dt(now)
+        await asyncio.sleep(max(1.0, (nxt - now).total_seconds()))
+
+        day = datetime.now(tz=MSK)
+        day_key = day.strftime("%Y-%m-%d")
+        if kv_get(conn, "daily_sent", "") == day_key:
+            continue
+
         try:
-            rows = await asyncio.to_thread(get_feedbacks_page, True, 100, 0)
-            for f in rows:
-                key = f"fb:{f.get('id') or f.get('uuid') or json.dumps(f, sort_keys=True)[:120]}"
-                if dedup_seen(key):
-                    continue
-                rating = f.get("productValuation") or f.get("valuation") or ""
-                text = (f.get("text") or "").strip() or "(без текста, только оценка)"
-                nm = f.get("productName") or f.get("subject") or "Товар"
-                dt = f.get("createdDate") or f.get("date") or ""
-                msg = f"💬 Новый отзыв\nТовар: {nm}\nОценка: {rating}\nОтзыв: {text}\nДата: {dt}"
-                await asyncio.to_thread(tg_send, msg)
-
+            orders = await asyncio.to_thread(stats_orders_for_day, day)
+            sales = await asyncio.to_thread(stats_sales_for_day, day)
+            await asyncio.to_thread(tg_send, fmt_daily_report(day, orders, sales))
+            kv_set(conn, "daily_sent", day_key)
         except Exception as e:
-            print(f"⚠️ feedbacks error: {e}")
-
-        await asyncio.sleep(_sleep_with_jitter(POLL_FEEDBACKS_SECONDS))
+            await asyncio.to_thread(tg_send, f"⚠️ Daily report error: {e}")
 
 
-async def poll_questions_loop() -> None:
-    while True:
-        try:
-            rows = await asyncio.to_thread(get_questions_page, True, 100, 0)
-            for q in rows:
-                key = f"q:{q.get('id') or q.get('uuid') or json.dumps(q, sort_keys=True)[:120]}"
-                if dedup_seen(key):
-                    continue
-                text = (q.get("text") or "").strip() or "(без текста)"
-                nm = q.get("productName") or q.get("subject") or "Товар"
-                dt = q.get("createdDate") or q.get("date") or ""
-                msg = f"❓ Новый вопрос\nТовар: {nm}\nВопрос: {text}\nДата: {dt}"
-                await asyncio.to_thread(tg_send, msg)
-
-        except Exception as e:
-            print(f"⚠️ questions error: {e}")
-
-        await asyncio.sleep(_sleep_with_jitter(POLL_QUESTIONS_SECONDS))
-
-
-# Placeholder FBS polling (kept minimal; safe even if you mostly FBW)
-async def poll_marketplace_loop() -> None:
-    while True:
-        try:
-            # Not implemented fully here to keep load low; your main focus is FBW.
-            # If needed, we can add marketplace orders/new later.
-            pass
-        except Exception as e:
-            print(f"⚠️ marketplace polling error: {e}")
-        await asyncio.sleep(_sleep_with_jitter(POLL_FBS_SECONDS))
-
-
-async def daily_summary_loop() -> None:
-    while True:
-        try:
-            now = datetime.now(MSK)
-            target = now.replace(hour=DAILY_SUMMARY_HOUR_MSK, minute=DAILY_SUMMARY_MINUTE_MSK, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-            await asyncio.sleep((target - now).total_seconds())
-
-            day = datetime.now(MSK)
-            sales = await asyncio.to_thread(get_sales, day)
-            orders = await asyncio.to_thread(get_orders, day)
-
-            sold_cnt = 0
-            sold_sum = 0.0
-            cancel_cnt = 0
-            cancel_sum = 0.0
-
-            for o in orders:
-                if bool(o.get("isCancel")):
-                    cancel_cnt += 1
-                    cancel_sum += order_amount(o)
-                else:
-                    sold_cnt += int(float(o.get("quantity") or 1))
-                    sold_sum += order_amount(o)
-
-            buy_cnt = 0
-            buy_sum = 0.0
-            ret_cnt = 0
-            ret_sum = 0.0
-
-            for s in sales:
-                amt = sale_amount(s)
-                if classify_sale(s) == "sale":
-                    buy_cnt += 1
-                    buy_sum += amt
-                else:
-                    ret_cnt += 1
-                    ret_sum += amt
-
-            msg = (
-                f"📊 Итог дня ({day.strftime('%d.%m.%Y')})\n"
-                f"🛒 Товаров продано: {sold_cnt} на сумму {sold_sum:.2f} ₽\n"
-                f"✅ Выкуп товаров произведён: {buy_cnt} на сумму {buy_sum:.2f} ₽\n"
-                f"❌ Отмен: {cancel_cnt} на сумму {cancel_sum:.2f} ₽\n"
-                f"↩️ Возвратов/отказов: {ret_cnt} на сумму {ret_sum:.2f} ₽"
-            )
-            await asyncio.to_thread(tg_send, msg)
-
-        except Exception as e:
-            print(f"⚠️ daily summary error: {e}")
-            await asyncio.sleep(60)
-
-
-# ---------------------------
-# FastAPI app (Render)
-# ---------------------------
-
-app = FastAPI(default_response_class=JSONResponse)
-
-
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "time": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    }
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    # IMPORTANT: do not block startup.
-    # Any DB/network warmups go to background threads.
-    asyncio.create_task(asyncio.to_thread(db))
-
-    # Gentle hello in background (never blocks port opening)
-    if not DISABLE_STARTUP_HELLO:
-        asyncio.create_task(
-            asyncio.to_thread(
-                tg_send,
-                "✅ WB→Telegram запущен (Render-safe). /health доступен."
-            )
-        )
-
-    # Start loops
-    asyncio.create_task(poll_marketplace_loop())
-    asyncio.create_task(poll_sales_loop())
-    asyncio.create_task(poll_feedbacks_loop())
-    asyncio.create_task(poll_fbw_loop())
-    asyncio.create_task(poll_questions_loop())
-    asyncio.create_task(daily_summary_loop())
-
-
-
-# ---------------------------
-# Background Worker entrypoint (Render Background Worker)
-# ---------------------------
-
-
-
-def prime_feedbacks_silently():
-    """Optional warm-up step.
-    In some deployments this function may be absent; we keep a no-op implementation
-    so the worker can start reliably.
-    """
-    return
+# ------------------- Entrypoint -------------------
 async def run_worker() -> None:
-    # Initialize DB and prime feedbacks in background (never block)
-    asyncio.create_task(asyncio.to_thread(db))
-    asyncio.create_task(asyncio.to_thread(prime_feedbacks_silently))
-
-    # Start loops
-    asyncio.create_task(poll_marketplace_loop())
-    asyncio.create_task(poll_sales_loop())
-    asyncio.create_task(poll_feedbacks_loop())
-    asyncio.create_task(poll_fbw_loop())
-    asyncio.create_task(daily_summary_loop())
-    asyncio.create_task(poll_questions_loop())
+    conn = await asyncio.to_thread(db)
 
     if not DISABLE_STARTUP_HELLO:
-        asyncio.create_task(asyncio.to_thread(
-            tg_send,
-            "✅ WB→Telegram запущен (Worker)."
-        ))
+        asyncio.create_task(asyncio.to_thread(tg_send, f"✅ WB→Telegram запущен (FBS + итоги). {SHOP_NAME}"))
 
+    asyncio.create_task(poll_fbs_loop(conn))
+    asyncio.create_task(daily_summary_loop(conn))
+
+    # Keep process alive forever
     await asyncio.Event().wait()
 
 
