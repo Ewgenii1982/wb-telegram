@@ -1,14 +1,7 @@
-#!/usr/bin/env python3
-"""
-WB → Telegram bot (Render Background Worker)
-
-ONLY:
-  1) New FBS orders notifications (Marketplace API /api/v3/orders/new)
-  2) Daily summary at 23:50 MSK (Statistics API: supplier/orders + supplier/sales)
-
-Everything else is intentionally removed.
-Run command (Render Background Worker): python app.py
-"""
+# app.py — WB → Telegram
+# Notifications: ONLY FBS orders (Marketplace API)
+# Daily report: ALL sales/orders of the shop (Statistics API) — like before
+# Deploy as Render Background Worker. Start Command: python app.py
 
 from __future__ import annotations
 
@@ -25,31 +18,34 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from zoneinfo import ZoneInfo
 
-# ------------------- ENV -------------------
+# --- Base URLs (can be overridden via ENV, but defaults are correct) ---
+WB_MARKETPLACE_BASE = os.getenv("WB_MARKETPLACE_BASE", "https://marketplace-api.wildberries.ru").rstrip("/")
+WB_STATISTICS_BASE = os.getenv("WB_STATISTICS_BASE", "https://statistics-api.wildberries.ru").rstrip("/")
+TG_API_BASE = "https://api.telegram.org"
+
+# --- Required ENV ---
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
-WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()          # Marketplace (FBS orders)
-WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()    # Statistics (daily report)
+WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()        # Marketplace API token (FBS)
+WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()  # Statistics API token (daily report)
 
+# --- Optional ENV ---
 SHOP_NAME = os.getenv("SHOP_NAME", "Магазин").strip()
 
 DB_PATH = (os.getenv("DB_PATH", "/tmp/wb_bot.sqlite").strip() or "/tmp/wb_bot.sqlite")
 
 POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "30"))
+
 DAILY_SUMMARY_HOUR_MSK = int(os.getenv("DAILY_SUMMARY_HOUR_MSK", "23"))
 DAILY_SUMMARY_MINUTE_MSK = int(os.getenv("DAILY_SUMMARY_MINUTE_MSK", "50"))
-DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip().lower() in ("1", "true", "yes")
 
-# Bases (optional override via ENV, but have safe defaults)
-WB_MARKETPLACE_BASE = os.getenv("WB_MARKETPLACE_BASE", "https://marketplace-api.wildberries.ru").rstrip("/")
-WB_STATISTICS_BASE = os.getenv("WB_STATISTICS_BASE", "https://statistics-api.wildberries.ru").rstrip("/")
-TG_API_BASE = "https://api.telegram.org"
+DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip().lower() in ("1", "true", "yes")
 
 MSK = ZoneInfo("Europe/Moscow")
 
 
-# ------------------- SQLite (dedup + kv) -------------------
+# ---------------- SQLite (dedup + kv) ----------------
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -88,8 +84,9 @@ def mark_seen(conn: sqlite3.Connection, order_id: str) -> None:
     conn.commit()
 
 
-# ------------------- Telegram -------------------
+# ---------------- Telegram ----------------
 def tg_send(text: str) -> None:
+    """Never raises (so it can't crash the worker)."""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     url = f"{TG_API_BASE}/bot{TG_BOT_TOKEN}/sendMessage"
@@ -97,11 +94,10 @@ def tg_send(text: str) -> None:
     try:
         requests.post(url, json=payload, timeout=(5, 30))
     except Exception:
-        # Never crash worker because of Telegram
         pass
 
 
-# ------------------- HTTP helper (backoff + host cooldown) -------------------
+# ---------------- HTTP helpers (backoff + cooldown) ----------------
 @dataclass
 class Cooldown:
     until_ts: float = 0.0
@@ -157,7 +153,6 @@ def http_json(
             if resp.status_code >= 400:
                 return {"_http_status": resp.status_code, "_text": resp.text}
 
-            # Sometimes WB gateways return HTML
             if resp.text.strip().startswith("<"):
                 wait = min(180.0, 8.0 * attempt)
                 _set_cooldown(url, wait)
@@ -176,7 +171,7 @@ def http_json(
     raise last_err or RuntimeError("http_json failed")
 
 
-# ------------------- WB API -------------------
+# ---------------- WB API ----------------
 def mp_headers() -> Dict[str, str]:
     return {"Authorization": WB_MP_TOKEN}
 
@@ -190,15 +185,12 @@ def mp_get_new_fbs_orders() -> List[Dict[str, Any]]:
     data = http_json("GET", url, headers=mp_headers())
     if isinstance(data, dict) and "_http_status" in data:
         raise RuntimeError(f"marketplace http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
-    if isinstance(data, dict):
-        orders = data.get("orders")
-        if isinstance(orders, list):
-            return orders
+    if isinstance(data, dict) and isinstance(data.get("orders"), list):
+        return data["orders"]
     return data if isinstance(data, list) else []
 
 
 def _datefrom_for_day(day_msk: datetime) -> str:
-    # Keep explicit +03:00 in ISO string (MSK)
     return day_msk.astimezone(MSK).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
@@ -220,7 +212,7 @@ def stats_sales_for_day(day_msk: datetime) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-# ------------------- Formatting -------------------
+# ---------------- Formatting helpers ----------------
 def _money(v: Any) -> float:
     try:
         if v is None:
@@ -248,6 +240,7 @@ def fmt_fbs_order(order: Dict[str, Any]) -> str:
     oid = str(order.get("id") or order.get("orderId") or order.get("wbOrderId") or "").strip()
     created = str(order.get("createdAt") or order.get("dateCreated") or "").strip()
     wh = str(order.get("warehouseName") or order.get("warehouse") or "").strip()
+
     items = order.get("items") if isinstance(order.get("items"), list) else []
 
     lines: List[str] = [f"🧾 Новый заказ FBS · {SHOP_NAME}"]
@@ -261,7 +254,7 @@ def fmt_fbs_order(order: Dict[str, Any]) -> str:
     if items:
         lines.append("")
         lines.append("Товары:")
-        for it in items[:30]:
+        for it in items[:50]:
             name = (it.get("name") or it.get("subject") or it.get("supplierArticle") or "").strip()
             nm = it.get("nmId") or it.get("nmID") or it.get("article") or ""
             qty = int(_money(it.get("quantity") or it.get("count") or 1) or 1)
@@ -313,18 +306,18 @@ def fmt_daily_report(day_msk: datetime, orders: List[Dict[str, Any]], sales: Lis
             f"📊 Итоги дня · {SHOP_NAME}",
             f"Дата: {d_str}",
             "",
-            f"🧾 FBS заказы (оформлено): {int(sold_count)} шт • {sold_sum:.2f} ₽",
-            f"✅ Выкуп (sales): {int(buy_count)} шт • {buy_sum:.2f} ₽",
+            f"🛒 Продано (заказы): {int(sold_count)} шт • {sold_sum:.2f} ₽",
+            f"✅ Выкуп: {int(buy_count)} шт • {buy_sum:.2f} ₽",
             f"❌ Отмены: {int(cancel_count)} шт • {cancel_sum:.2f} ₽",
             f"↩️ Возвраты: {int(ret_count)} шт • {ret_sum:.2f} ₽",
         ]
     )
 
 
-# ------------------- Loops -------------------
+# ---------------- Loops ----------------
 async def poll_fbs_loop(conn: sqlite3.Connection) -> None:
     if not WB_MP_TOKEN:
-        await asyncio.to_thread(tg_send, "⚠️ WB_MP_TOKEN не задан — уведомления FBS отключены.")
+        await asyncio.to_thread(tg_send, "⚠️ WB_MP_TOKEN не задан — уведомления по заказам FBS отключены.")
         return
 
     while True:
@@ -380,17 +373,21 @@ async def daily_summary_loop(conn: sqlite3.Connection) -> None:
             await asyncio.to_thread(tg_send, f"⚠️ Daily report error: {e}")
 
 
-# ------------------- Entrypoint -------------------
+# ---------------- Worker entrypoint ----------------
 async def run_worker() -> None:
     conn = await asyncio.to_thread(db)
 
     if not DISABLE_STARTUP_HELLO:
-        asyncio.create_task(asyncio.to_thread(tg_send, f"✅ WB→Telegram запущен (FBS + итоги). {SHOP_NAME}"))
+        asyncio.create_task(
+            asyncio.to_thread(
+                tg_send,
+                f"✅ WB→Telegram запущен (уведомления: FBS; итоги: все продажи/выкупы). {SHOP_NAME}",
+            )
+        )
 
     asyncio.create_task(poll_fbs_loop(conn))
     asyncio.create_task(daily_summary_loop(conn))
 
-    # Keep process alive forever
     await asyncio.Event().wait()
 
 
