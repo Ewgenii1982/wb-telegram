@@ -45,6 +45,7 @@ MSK = ZoneInfo("Europe/Moscow")
 _STOCK_CACHE: Dict[Tuple[int, int], Tuple[float, int]] = {}  # (warehouse_id, chrt_id) -> (expires_ts, amount)
 _CONTENT_SIZES_CACHE: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}  # nmId -> (expires_ts, sizes)
 _PRODUCT_NAME_CACHE: Dict[int, Tuple[float, str]] = {}
+_CONTENT_CARD_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 STOCK_CACHE_TTL_SECONDS = int(os.getenv("STOCK_CACHE_TTL_SECONDS", "20"))
 CONTENT_CACHE_TTL_SECONDS = int(os.getenv("CONTENT_CACHE_TTL_SECONDS", "21600"))  # 6 hours
 
@@ -240,7 +241,57 @@ def content_get_cards_by_nm(nm_ids: List[int]) -> List[Dict[str, Any]]:
     if isinstance(data, dict) and "_http_status" in data:
         return []
     cards = data.get("cards") if isinstance(data, dict) else []
-    return cards if isinstance(cards, list) else []
+    if not isinstance(cards, list):
+        return []
+
+    # Cache full cards by nmID/nmId. This is important because Marketplace order fields
+    # can contain ambiguous/unstable "subject" text; the actual product title/vendorCode
+    # should be taken from Content API by nmId whenever possible.
+    expires = time.time() + CONTENT_CACHE_TTL_SECONDS
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        cid = int_safe(card.get("nmID") or card.get("nmId") or card.get("nm_id"))
+        if cid:
+            _CONTENT_CARD_CACHE[cid] = (expires, card)
+    return cards
+
+
+
+def content_get_card(nm_id: int) -> Dict[str, Any]:
+    if not nm_id:
+        return {}
+    cached = _CONTENT_CARD_CACHE.get(nm_id)
+    if cached and time.time() < cached[0]:
+        return cached[1]
+    cards = content_get_cards_by_nm([nm_id])
+    for card in cards:
+        cid = int_safe(card.get("nmID") or card.get("nmId") or card.get("nm_id"))
+        if cid == nm_id:
+            return card
+    return {}
+
+
+def content_title(nm_id: int) -> str:
+    card = content_get_card(nm_id)
+    if not card:
+        return ""
+    for k in ("title", "imtName", "goodsName", "name", "object", "objectName", "subjectName"):
+        val = str(card.get(k) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def content_vendor_code(nm_id: int) -> str:
+    card = content_get_card(nm_id)
+    if not card:
+        return ""
+    for k in ("vendorCode", "supplierArticle", "article"):
+        val = str(card.get(k) or "").strip()
+        if val:
+            return val
+    return ""
 
 
 def content_get_sizes(nm_id: int) -> List[Dict[str, Any]]:
@@ -390,17 +441,37 @@ def resolve_warehouse_id(order: Dict[str, Any], it: Dict[str, Any]) -> int:
 
 
 def product_name(it: Dict[str, Any]) -> str:
-    for k in ("name", "subject", "subjectName", "title", "goodsName"):
+    nm_id = int_safe(it.get("nmId") or it.get("nmID"))
+
+    # IMPORTANT: for /api/v3/orders/new, fields like subject/name in the order payload
+    # can be incomplete, category-like, or inconsistent after card edits.
+    # To avoid messages like "cash tape" mixed with a comb nmId/vendorCode,
+    # we prefer the real card title from Content API by nmId.
+    name = content_title(nm_id)
+    if name:
+        return name
+
+    # Fallback only if Content API is unavailable. Keep "subject" as a late fallback,
+    # not the main source of truth.
+    for k in ("title", "goodsName", "name", "subjectName", "subject"):
         val = str(it.get(k) or "").strip()
         if val:
             return val
-    nm_id = int_safe(it.get("nmId") or it.get("nmID"))
-    name = product_name_from_content(nm_id)
-    if name:
-        return name
-    article = str(it.get("supplierArticle") or it.get("article") or it.get("vendorCode") or "").strip()
+
+    article = seller_article(it)
     return article or "Товар"
 
+
+def seller_article(it: Dict[str, Any]) -> str:
+    nm_id = int_safe(it.get("nmId") or it.get("nmID"))
+    vc = content_vendor_code(nm_id)
+    if vc:
+        return vc
+    for k in ("supplierArticle", "vendorCode", "article"):
+        val = str(it.get(k) or "").strip()
+        if val:
+            return val
+    return ""
 
 def order_price(it: Dict[str, Any]) -> float:
     # WB often sends price in kopecks in Marketplace orders.
@@ -453,7 +524,7 @@ def fmt_fbs_order(order: Dict[str, Any]) -> str:
         lines.append(f"• {product_name(it)}")
         if nm_id:
             lines.append(f"  Артикул WB: {nm_id}")
-        article = str(it.get("supplierArticle") or it.get("article") or it.get("vendorCode") or "").strip()
+        article = seller_article(it)
         if article:
             lines.append(f"  Артикул продавца: {article}")
         sku = skus_text(it)
