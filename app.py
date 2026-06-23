@@ -1,7 +1,6 @@
-# app.py — WB → Telegram
-# Notifications: ONLY FBS orders (Marketplace API)
-# Daily report: ALL sales/orders of the shop (Statistics API) — like before
-# Deploy as Render Background Worker. Start Command: python app.py
+# app.py — WB -> Telegram (ONLY FBS orders + Daily report + FBS stock in order notification)
+# Render: use Background Worker
+# Start Command: python app.py
 
 from __future__ import annotations
 
@@ -18,34 +17,39 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 from zoneinfo import ZoneInfo
 
-# --- Base URLs (can be overridden via ENV, but defaults are correct) ---
+# ---------- Base URLs ----------
 WB_MARKETPLACE_BASE = os.getenv("WB_MARKETPLACE_BASE", "https://marketplace-api.wildberries.ru").rstrip("/")
 WB_STATISTICS_BASE = os.getenv("WB_STATISTICS_BASE", "https://statistics-api.wildberries.ru").rstrip("/")
+WB_CONTENT_BASE = os.getenv("WB_CONTENT_BASE", "https://content-api.wildberries.ru").rstrip("/")
 TG_API_BASE = "https://api.telegram.org"
 
-# --- Required ENV ---
+# ---------- Required ENV ----------
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()              # Marketplace API token: FBS orders + seller stocks
+WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()        # Statistics API token: daily report
 
-WB_MP_TOKEN = os.getenv("WB_MP_TOKEN", "").strip()        # Marketplace API token (FBS)
-WB_STATS_TOKEN = os.getenv("WB_STATS_TOKEN", "").strip()  # Statistics API token (daily report)
-
-# --- Optional ENV ---
+# ---------- Optional ENV ----------
+WB_CONTENT_TOKEN = os.getenv("WB_CONTENT_TOKEN", "").strip()    # Optional: product names / barcode->chrtId fallback
+SELLER_WAREHOUSE_ID = os.getenv("SELLER_WAREHOUSE_ID", "").strip()
 SHOP_NAME = os.getenv("SHOP_NAME", "Магазин").strip()
-
 DB_PATH = (os.getenv("DB_PATH", "/tmp/wb_bot.sqlite").strip() or "/tmp/wb_bot.sqlite")
-
 POLL_FBS_SECONDS = int(os.getenv("POLL_FBS_SECONDS", "30"))
-
 DAILY_SUMMARY_HOUR_MSK = int(os.getenv("DAILY_SUMMARY_HOUR_MSK", "23"))
 DAILY_SUMMARY_MINUTE_MSK = int(os.getenv("DAILY_SUMMARY_MINUTE_MSK", "50"))
-
 DISABLE_STARTUP_HELLO = os.getenv("DISABLE_STARTUP_HELLO", "0").strip().lower() in ("1", "true", "yes")
 
 MSK = ZoneInfo("Europe/Moscow")
 
+# ---------- small in-memory caches ----------
+_STOCK_CACHE: Dict[Tuple[int, int], Tuple[float, int]] = {}  # (warehouse_id, chrt_id) -> (expires_ts, amount)
+_CONTENT_SIZES_CACHE: Dict[int, Tuple[float, List[Dict[str, Any]]]] = {}  # nmId -> (expires_ts, sizes)
+_PRODUCT_NAME_CACHE: Dict[int, Tuple[float, str]] = {}
+STOCK_CACHE_TTL_SECONDS = int(os.getenv("STOCK_CACHE_TTL_SECONDS", "20"))
+CONTENT_CACHE_TTL_SECONDS = int(os.getenv("CONTENT_CACHE_TTL_SECONDS", "21600"))  # 6 hours
 
-# ---------------- SQLite (dedup + kv) ----------------
+
+# ---------------- SQLite ----------------
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -86,7 +90,6 @@ def mark_seen(conn: sqlite3.Connection, order_id: str) -> None:
 
 # ---------------- Telegram ----------------
 def tg_send(text: str) -> None:
-    """Never raises (so it can't crash the worker)."""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     url = f"{TG_API_BASE}/bot{TG_BOT_TOKEN}/sendMessage"
@@ -97,7 +100,7 @@ def tg_send(text: str) -> None:
         pass
 
 
-# ---------------- HTTP helpers (backoff + cooldown) ----------------
+# ---------------- HTTP helpers ----------------
 @dataclass
 class Cooldown:
     until_ts: float = 0.0
@@ -171,7 +174,7 @@ def http_json(
     raise last_err or RuntimeError("http_json failed")
 
 
-# ---------------- WB API ----------------
+# ---------------- WB headers ----------------
 def mp_headers() -> Dict[str, str]:
     return {"Authorization": WB_MP_TOKEN}
 
@@ -180,14 +183,98 @@ def stats_headers() -> Dict[str, str]:
     return {"Authorization": WB_STATS_TOKEN}
 
 
+def content_headers() -> Dict[str, str]:
+    token = WB_CONTENT_TOKEN or WB_MP_TOKEN
+    return {"Authorization": token}
+
+
+# ---------------- WB API calls ----------------
 def mp_get_new_fbs_orders() -> List[Dict[str, Any]]:
     url = f"{WB_MARKETPLACE_BASE}/api/v3/orders/new"
     data = http_json("GET", url, headers=mp_headers())
     if isinstance(data, dict) and "_http_status" in data:
-        raise RuntimeError(f"marketplace http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
-    if isinstance(data, dict) and isinstance(data.get("orders"), list):
-        return data["orders"]
+        raise RuntimeError(f"marketplace http {data.get('_http_status')}: {str(data.get('_text'))[:300]}")
+    if isinstance(data, dict):
+        orders = data.get("orders")
+        if isinstance(orders, list):
+            return orders
     return data if isinstance(data, list) else []
+
+
+def seller_stock_amount(warehouse_id: int, chrt_id: int) -> Optional[int]:
+    if not warehouse_id or not chrt_id or not WB_MP_TOKEN:
+        return None
+
+    cache_key = (warehouse_id, chrt_id)
+    cached = _STOCK_CACHE.get(cache_key)
+    if cached and time.time() < cached[0]:
+        return cached[1]
+
+    url = f"{WB_MARKETPLACE_BASE}/api/v3/stocks/{warehouse_id}"
+    data = http_json("POST", url, headers=mp_headers(), json_body={"chrtIds": [chrt_id]}, max_tries=4)
+    if isinstance(data, dict) and "_http_status" in data:
+        return None
+
+    stocks = data.get("stocks") if isinstance(data, dict) else data
+    if isinstance(stocks, list):
+        for s in stocks:
+            if int_safe(s.get("chrtId") or s.get("chrtID")) == chrt_id:
+                amount = int_safe(s.get("amount") or s.get("quantity") or 0)
+                _STOCK_CACHE[cache_key] = (time.time() + STOCK_CACHE_TTL_SECONDS, amount)
+                return amount
+    return None
+
+
+def content_get_cards_by_nm(nm_ids: List[int]) -> List[Dict[str, Any]]:
+    """Best-effort Content API call. Used only for names and barcode->chrtId fallback."""
+    if not nm_ids or not (WB_CONTENT_TOKEN or WB_MP_TOKEN):
+        return []
+    url = f"{WB_CONTENT_BASE}/content/v2/get/cards/list"
+    body = {
+        "settings": {
+            "cursor": {"limit": 100},
+            "filter": {"withPhoto": -1, "nmID": nm_ids},
+        }
+    }
+    data = http_json("POST", url, headers=content_headers(), json_body=body, max_tries=3)
+    if isinstance(data, dict) and "_http_status" in data:
+        return []
+    cards = data.get("cards") if isinstance(data, dict) else []
+    return cards if isinstance(cards, list) else []
+
+
+def content_get_sizes(nm_id: int) -> List[Dict[str, Any]]:
+    if not nm_id:
+        return []
+    cached = _CONTENT_SIZES_CACHE.get(nm_id)
+    if cached and time.time() < cached[0]:
+        return cached[1]
+
+    cards = content_get_cards_by_nm([nm_id])
+    sizes: List[Dict[str, Any]] = []
+    name = ""
+    if cards:
+        card = cards[0]
+        name = str(card.get("title") or card.get("subjectName") or card.get("vendorCode") or "").strip()
+        raw_sizes = card.get("sizes")
+        if isinstance(raw_sizes, list):
+            sizes = raw_sizes
+
+    if name:
+        _PRODUCT_NAME_CACHE[nm_id] = (time.time() + CONTENT_CACHE_TTL_SECONDS, name)
+    _CONTENT_SIZES_CACHE[nm_id] = (time.time() + CONTENT_CACHE_TTL_SECONDS, sizes)
+    return sizes
+
+
+def product_name_from_content(nm_id: int) -> str:
+    if not nm_id:
+        return ""
+    cached = _PRODUCT_NAME_CACHE.get(nm_id)
+    if cached and time.time() < cached[0]:
+        return cached[1]
+    content_get_sizes(nm_id)
+    cached = _PRODUCT_NAME_CACHE.get(nm_id)
+    return cached[1] if cached else ""
 
 
 def _datefrom_for_day(day_msk: datetime) -> str:
@@ -199,7 +286,7 @@ def stats_orders_for_day(day_msk: datetime) -> List[Dict[str, Any]]:
     params = {"dateFrom": _datefrom_for_day(day_msk), "flag": 1}
     data = http_json("GET", url, headers=stats_headers(), params=params)
     if isinstance(data, dict) and "_http_status" in data:
-        raise RuntimeError(f"statistics orders http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
+        raise RuntimeError(f"statistics orders http {data.get('_http_status')}: {str(data.get('_text'))[:300]}")
     return data if isinstance(data, list) else []
 
 
@@ -208,14 +295,23 @@ def stats_sales_for_day(day_msk: datetime) -> List[Dict[str, Any]]:
     params = {"dateFrom": _datefrom_for_day(day_msk), "flag": 1}
     data = http_json("GET", url, headers=stats_headers(), params=params)
     if isinstance(data, dict) and "_http_status" in data:
-        raise RuntimeError(f"statistics sales http {data.get('_http_status')}: {str(data.get('_text'))[:200]}")
+        raise RuntimeError(f"statistics sales http {data.get('_http_status')}: {str(data.get('_text'))[:300]}")
     return data if isinstance(data, list) else []
 
 
-# ---------------- Formatting helpers ----------------
-def _money(v: Any) -> float:
+# ---------------- utils ----------------
+def int_safe(v: Any, default: int = 0) -> int:
     try:
-        if v is None:
+        if v in (None, ""):
+            return default
+        return int(float(str(v).replace(",", ".")))
+    except Exception:
+        return default
+
+
+def money_safe(v: Any) -> float:
+    try:
+        if v in (None, ""):
             return 0.0
         if isinstance(v, (int, float)):
             return float(v)
@@ -224,49 +320,152 @@ def _money(v: Any) -> float:
         return 0.0
 
 
-def _best_sum(o: Dict[str, Any], keys: Iterable[str]) -> float:
+def best_sum(o: Dict[str, Any], keys: Iterable[str]) -> float:
     for k in keys:
         if k in o and o[k] not in (None, ""):
-            val = _money(o.get(k))
+            val = money_safe(o.get(k))
             if val != 0:
                 return val
     for k in keys:
         if k in o:
-            return _money(o.get(k))
+            return money_safe(o.get(k))
     return 0.0
 
 
+def fmt_money(v: float) -> str:
+    return f"{v:.2f} ₽" if abs(v - round(v)) > 0.001 else f"{int(round(v))} ₽"
+
+
+def resolve_order_id(order: Dict[str, Any]) -> str:
+    for k in ("id", "orderId", "wbOrderId", "rid", "srid"):
+        val = order.get(k)
+        if val not in (None, ""):
+            return str(val)
+    return str(hash(json.dumps(order, ensure_ascii=False, sort_keys=True)))
+
+
+def order_items(order: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = order.get("items")
+    if isinstance(items, list) and items:
+        return [it for it in items if isinstance(it, dict)]
+    return [order]
+
+
+def skus_text(it: Dict[str, Any]) -> str:
+    skus = it.get("skus") or it.get("barcodes") or it.get("barcode") or it.get("sku")
+    if isinstance(skus, list):
+        return ", ".join(str(x) for x in skus if x is not None)
+    return str(skus or "").strip()
+
+
+def first_sku(it: Dict[str, Any]) -> str:
+    skus = it.get("skus") or it.get("barcodes") or it.get("barcode") or it.get("sku")
+    if isinstance(skus, list):
+        return str(skus[0]) if skus else ""
+    return str(skus or "").strip()
+
+
+def resolve_chrt_id(it: Dict[str, Any]) -> int:
+    direct = int_safe(it.get("chrtId") or it.get("chrtID"))
+    if direct:
+        return direct
+
+    nm_id = int_safe(it.get("nmId") or it.get("nmID"))
+    barcode = first_sku(it)
+    if not nm_id or not barcode:
+        return 0
+
+    # fallback: Content sizes contains chrtID/chrtId and skus list
+    for s in content_get_sizes(nm_id):
+        s_skus = s.get("skus") or []
+        if barcode and str(barcode) in [str(x) for x in s_skus]:
+            return int_safe(s.get("chrtId") or s.get("chrtID"))
+    return 0
+
+
+def resolve_warehouse_id(order: Dict[str, Any], it: Dict[str, Any]) -> int:
+    return int_safe(
+        it.get("warehouseId") or it.get("warehouseID") or order.get("warehouseId") or order.get("warehouseID") or SELLER_WAREHOUSE_ID
+    )
+
+
+def product_name(it: Dict[str, Any]) -> str:
+    for k in ("name", "subject", "subjectName", "title", "goodsName"):
+        val = str(it.get(k) or "").strip()
+        if val:
+            return val
+    nm_id = int_safe(it.get("nmId") or it.get("nmID"))
+    name = product_name_from_content(nm_id)
+    if name:
+        return name
+    article = str(it.get("supplierArticle") or it.get("article") or it.get("vendorCode") or "").strip()
+    return article or "Товар"
+
+
+def order_price(it: Dict[str, Any]) -> float:
+    # WB often sends price in kopecks in Marketplace orders.
+    raw = best_sum(it, ["convertedPrice", "price", "priceWithDisc", "totalPrice", "forPay"])
+    if raw > 100000:  # very likely kopecks
+        return raw / 100.0
+    # For marketplace order price can also be like 36400 for 364 ₽; divide if no decimal and suspiciously high.
+    if raw >= 10000:
+        return raw / 100.0
+    return raw
+
+
+def order_qty(it: Dict[str, Any]) -> int:
+    qty = int_safe(it.get("quantity") or it.get("qty") or it.get("count") or 1, 1)
+    return max(1, qty)
+
+
+# ---------------- formatting ----------------
 def fmt_fbs_order(order: Dict[str, Any]) -> str:
-    oid = str(order.get("id") or order.get("orderId") or order.get("wbOrderId") or "").strip()
-    created = str(order.get("createdAt") or order.get("dateCreated") or "").strip()
-    wh = str(order.get("warehouseName") or order.get("warehouse") or "").strip()
+    oid = resolve_order_id(order)
+    created = str(order.get("createdAt") or order.get("dateCreated") or order.get("created") or "").strip()
+    wh_name = str(order.get("warehouseName") or order.get("warehouse") or "").strip()
 
-    items = order.get("items") if isinstance(order.get("items"), list) else []
+    items = order_items(order)
+    total_qty = 0
+    total_sum = 0.0
 
-    lines: List[str] = [f"🧾 Новый заказ FBS · {SHOP_NAME}"]
+    lines: List[str] = [f"🏬 Новый заказ FBS · {SHOP_NAME}"]
+    if wh_name:
+        lines.append(f"📦 Склад отгрузки: {wh_name}")
     if oid:
         lines.append(f"Заказ: {oid}")
-    if wh:
-        lines.append(f"Склад: {wh}")
     if created:
         lines.append(f"Дата: {created}")
+    lines.append("")
 
-    if items:
-        lines.append("")
-        lines.append("Товары:")
-        for it in items[:50]:
-            name = (it.get("name") or it.get("subject") or it.get("supplierArticle") or "").strip()
-            nm = it.get("nmId") or it.get("nmID") or it.get("article") or ""
-            qty = int(_money(it.get("quantity") or it.get("count") or 1) or 1)
-            price = _best_sum(it, ["priceWithDisc", "price", "totalPrice", "forPay"])
-            s = f"• {name}" if name else "• Товар"
-            if nm:
-                s += f" (nmId: {nm})"
-            s += f" — {qty} шт"
-            if price:
-                s += f" • {price:.2f} ₽"
-            lines.append(s)
+    for it in items:
+        qty = order_qty(it)
+        price = order_price(it)
+        line_sum = price * qty if price else 0.0
+        total_qty += qty
+        total_sum += line_sum
 
+        nm_id = int_safe(it.get("nmId") or it.get("nmID"))
+        chrt_id = resolve_chrt_id(it)
+        warehouse_id = resolve_warehouse_id(order, it)
+        stock = seller_stock_amount(warehouse_id, chrt_id) if warehouse_id and chrt_id else None
+        stock_text = str(stock) if stock is not None else "-"
+
+        lines.append(f"• {product_name(it)}")
+        if nm_id:
+            lines.append(f"  Артикул WB: {nm_id}")
+        article = str(it.get("supplierArticle") or it.get("article") or it.get("vendorCode") or "").strip()
+        if article:
+            lines.append(f"  Артикул продавца: {article}")
+        sku = skus_text(it)
+        if sku:
+            lines.append(f"  SKU/Баркод: {sku}")
+        lines.append(f"  — {qty} шт" + (f" • {fmt_money(line_sum)}" if line_sum else ""))
+        lines.append(f"  Остаток FBS: {stock_text}")
+
+    lines.append("")
+    lines.append(f"Итого позиций: {total_qty}")
+    if total_sum:
+        lines.append(f"Сумма: {fmt_money(total_sum)}")
     return "\n".join(lines)
 
 
@@ -276,8 +475,8 @@ def fmt_daily_report(day_msk: datetime, orders: List[Dict[str, Any]], sales: Lis
 
     for o in orders:
         is_cancel = bool(o.get("isCancel"))
-        qty = _money(o.get("quantity") or 1) or 1
-        price = _best_sum(o, ["totalPrice", "priceWithDisc", "forPay", "price"])
+        qty = money_safe(o.get("quantity") or 1) or 1
+        price = best_sum(o, ["totalPrice", "priceWithDisc", "forPay", "price"])
         if is_cancel:
             cancel_count += qty
             cancel_sum += price
@@ -290,8 +489,8 @@ def fmt_daily_report(day_msk: datetime, orders: List[Dict[str, Any]], sales: Lis
 
     for s in sales:
         sale_id = str(s.get("saleID") or s.get("saleId") or s.get("srid") or "")
-        qty = _money(s.get("quantity") or 1) or 1
-        amount = _best_sum(s, ["forPay", "priceWithDisc", "totalPrice", "price"])
+        qty = money_safe(s.get("quantity") or 1) or 1
+        amount = best_sum(s, ["forPay", "priceWithDisc", "totalPrice", "price"])
         is_return = sale_id.startswith("R") or amount < 0
         if is_return:
             ret_count += qty
@@ -306,27 +505,25 @@ def fmt_daily_report(day_msk: datetime, orders: List[Dict[str, Any]], sales: Lis
             f"📊 Итоги дня · {SHOP_NAME}",
             f"Дата: {d_str}",
             "",
-            f"🛒 Продано (заказы): {int(sold_count)} шт • {sold_sum:.2f} ₽",
-            f"✅ Выкуп: {int(buy_count)} шт • {buy_sum:.2f} ₽",
-            f"❌ Отмены: {int(cancel_count)} шт • {cancel_sum:.2f} ₽",
-            f"↩️ Возвраты: {int(ret_count)} шт • {ret_sum:.2f} ₽",
+            f"🛒 Продано (заказы): {int(sold_count)} шт • {fmt_money(sold_sum)}",
+            f"✅ Выкуп: {int(buy_count)} шт • {fmt_money(buy_sum)}",
+            f"❌ Отмены: {int(cancel_count)} шт • {fmt_money(cancel_sum)}",
+            f"↩️ Возвраты: {int(ret_count)} шт • {fmt_money(ret_sum)}",
         ]
     )
 
 
-# ---------------- Loops ----------------
+# ---------------- loops ----------------
 async def poll_fbs_loop(conn: sqlite3.Connection) -> None:
     if not WB_MP_TOKEN:
-        await asyncio.to_thread(tg_send, "⚠️ WB_MP_TOKEN не задан — уведомления по заказам FBS отключены.")
+        await asyncio.to_thread(tg_send, "⚠️ WB_MP_TOKEN не задан — уведомления по FBS-заказам отключены.")
         return
 
     while True:
         try:
             orders = await asyncio.to_thread(mp_get_new_fbs_orders)
             for o in orders:
-                oid = str(o.get("id") or o.get("orderId") or o.get("wbOrderId") or "").strip()
-                if not oid:
-                    oid = str(hash(json.dumps(o, ensure_ascii=False, sort_keys=True)))
+                oid = resolve_order_id(o)
                 if seen_order(conn, oid):
                     continue
                 await asyncio.to_thread(tg_send, fmt_fbs_order(o))
@@ -373,17 +570,15 @@ async def daily_summary_loop(conn: sqlite3.Connection) -> None:
             await asyncio.to_thread(tg_send, f"⚠️ Daily report error: {e}")
 
 
-# ---------------- Worker entrypoint ----------------
+# ---------------- worker entrypoint ----------------
 async def run_worker() -> None:
     conn = await asyncio.to_thread(db)
 
     if not DISABLE_STARTUP_HELLO:
-        asyncio.create_task(
-            asyncio.to_thread(
-                tg_send,
-                f"✅ WB→Telegram запущен (уведомления: FBS; итоги: все продажи/выкупы). {SHOP_NAME}",
-            )
-        )
+        asyncio.create_task(asyncio.to_thread(
+            tg_send,
+            f"✅ WB→Telegram запущен (только FBS-заказы + итоги по магазину). {SHOP_NAME}",
+        ))
 
     asyncio.create_task(poll_fbs_loop(conn))
     asyncio.create_task(daily_summary_loop(conn))
